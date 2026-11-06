@@ -6,21 +6,8 @@ extension HomeStore {
         controlContextID = UUID()
         undoTimerTask?.cancel()
         undoBanner = nil
-        lastAssistantUndo = nil
-        setAssistantState(.idle)
-        pendingCloudConsent = nil
-        assistantSuggestions = []
-        aiProactiveSuggestions = nil
-        proactiveRefreshTask?.cancel()
-        proactiveRefreshTask = nil
-        isProactiveRecommending = false
-        proactiveRetryEarliest = nil
-        isGrokBallStageExpanded = false
-        grokBallCelebrationTask?.cancel()
-        grokBallCelebrationUntil = nil
+        lastActionUndo = nil
         optimisticLockUntil.removeAll()
-        // A different home is a different suggestion context even at the same ambient signature (Codex #116 review).
-        lastProactiveRefreshSignature = nil
         for task in debounceTasks.values { task.cancel() }
         debounceTasks.removeAll()
     }
@@ -32,7 +19,6 @@ extension HomeStore {
         Task {
             do {
                 try await executeDeviceCommand(.activateScene(entityId: scene.entityId))
-                confirmManualControl(intents: [.init(targetId: scene.id, operation: .activateScene)])
                 showToast(L10n.tr("已触发场景：\(scene.name)", "Activated scene: \(scene.name)"))
                 return true
             } catch {
@@ -44,14 +30,12 @@ extension HomeStore {
 
     public func executeQuickAction(
         _ action: QuickAction,
-        undoBannerDuration: TimeInterval? = nil,
-        recordsHabits: Bool = true
+        undoBannerDuration: TimeInterval? = nil
     ) {
         let previousSnapshot = devices
         var commands: [(deviceId: String, command: DeviceCommand)] = []
         var restoreCommands: [DeviceCommand] = []
         var affectedDeviceIds: Set<String> = []
-        var habitIntents: [DeviceIntent] = []
 
         switch action {
         case .lightsOff:
@@ -59,7 +43,6 @@ extension HomeStore {
                 guard case .light(var s) = devices[idx].kind, s.isOn else { continue }
                 let deviceId = devices[idx].id
                 affectedDeviceIds.insert(deviceId)
-                habitIntents.append(.init(targetId: deviceId, operation: .power(false)))
                 lockOptimistic(deviceId, duration: .seconds(3.0))
                 commands.append((deviceId, .setLightPower(entityId: s.entityId, isOn: false)))
                 restoreCommands.append(.setLightPower(entityId: s.entityId, isOn: true))
@@ -93,8 +76,6 @@ extension HomeStore {
                 guard case .light(var s) = devices[idx].kind else { continue }
                 let deviceId = devices[idx].id
                 affectedDeviceIds.insert(deviceId)
-                habitIntents.append(.init(targetId: deviceId, operation: .brightness(15)))
-                habitIntents.append(.init(targetId: deviceId, operation: .colorTemperature(max(s.minKelvin, 2700))))
                 lockOptimistic(deviceId, duration: .seconds(3.0))
                 let prevOn = s.isOn
                 let prevBri = s.brightnessPercent ?? 80
@@ -121,7 +102,6 @@ extension HomeStore {
                 case .climate(var s) where s.isOn && s.hvacMode != "off":
                     let prevMode = s.hvacMode
                     affectedDeviceIds.insert(deviceId)
-                    habitIntents.append(.init(targetId: deviceId, operation: .power(false)))
                     lockOptimistic(deviceId, duration: .seconds(3.0))
                     commands.append((deviceId, .setClimatePower(entityId: s.entityId, isOn: false, fallbackMode: prevMode)))
                     restoreCommands.append(.setClimatePower(entityId: s.entityId, isOn: true, fallbackMode: prevMode))
@@ -130,7 +110,6 @@ extension HomeStore {
                     devices[idx].kind = .climate(s)
                 case .fan(var s) where s.isOn:
                     affectedDeviceIds.insert(deviceId)
-                    habitIntents.append(.init(targetId: deviceId, operation: .power(false)))
                     lockOptimistic(deviceId, duration: .seconds(3.0))
                     commands.append((deviceId, .setFanPower(entityId: s.entityId, isOn: false)))
                     restoreCommands.append(.setFanPower(entityId: s.entityId, isOn: true))
@@ -152,7 +131,6 @@ extension HomeStore {
             restoreCommands: restoreCommands,
             previousDevices: previousSnapshot,
             deviceCount: affectedDeviceIds.count,
-            habitReceipt: nil,
             duration: undoBannerDuration
         )
         guard let bannerId = undoBanner?.id else { return }
@@ -168,11 +146,9 @@ extension HomeStore {
                     failedDeviceIds.insert(item.deviceId)
                 }
             }
-            // Habits train only on confirmed success, and only while the banner this action
-            // created is still the live one (an undo or expiry cancels the learning) (#113).
-            let succeededIntents = habitIntents.filter { !failedDeviceIds.contains($0.targetId) }
-            guard context == controlContextID, !succeededIntents.isEmpty, recordsHabits, undoBanner?.id == bannerId else { return }
-            undoBanner?.habitReceipt = confirmManualControl(intents: succeededIntents)
+            guard context == controlContextID else { return }
+            finishBatchAction(failedIds: failedDeviceIds, previous: previousSnapshot, bannerId: bannerId)
+
         }
     }
 
@@ -257,15 +233,10 @@ extension HomeStore {
         let previousSnapshot = devices
         var offCommands: [(deviceId: String, command: DeviceCommand)] = []
         var restoreCommands: [DeviceCommand] = []
-        var habitIntents: [DeviceIntent] = []
 
         for idx in devices.indices where targetIds.contains(devices[idx].id) {
             guard let change = Self.allOffChange(for: devices[idx]) else { continue }
             let deviceId = devices[idx].id
-            // A vacuum returning home has no power op, so it executes but does not train a habit (#113).
-            if UserHabitMemory.isPowerToggleable(devices[idx]) {
-                habitIntents.append(.init(targetId: deviceId, operation: .power(false)))
-            }
             lockOptimistic(deviceId, duration: .seconds(3.0))
             offCommands.append((deviceId, change.off))
             restoreCommands.append(change.restore)
@@ -276,8 +247,7 @@ extension HomeStore {
             title: L10n.tr("已关闭 \(offCommands.count) 台设备", "Turned off \(offCommands.count) device(s)"),
             restoreCommands: restoreCommands,
             previousDevices: previousSnapshot,
-            deviceCount: targetIds.count,
-            habitReceipt: nil
+            deviceCount: targetIds.count
         )
         guard let bannerId = undoBanner?.id else { return }
 
@@ -292,15 +262,14 @@ extension HomeStore {
                     failedDeviceIds.insert(item.deviceId)
                 }
             }
-            // Habits train only on confirmed success while this action's banner is live (#113).
-            let succeededIntents = habitIntents.filter { !failedDeviceIds.contains($0.targetId) }
-            guard context == controlContextID, !succeededIntents.isEmpty, undoBanner?.id == bannerId else { return }
-            undoBanner?.habitReceipt = confirmManualControl(intents: succeededIntents)
+            guard context == controlContextID else { return }
+            finishBatchAction(failedIds: failedDeviceIds, previous: previousSnapshot, bannerId: bannerId)
+
         }
     }
 
     /// How long the 撤销 banner stays after 全关 and similar bulk actions (#23): 10 s for one or two
-    /// devices, 15 s from three on so the user can read which devices the AI touched (#53).
+    /// devices, 15 s from three on so the user can read which devices changed (#53).
     nonisolated static func undoBannerSeconds(forDeviceCount count: Int) -> Double {
         count >= 3 ? 15 : 10
     }
@@ -310,17 +279,16 @@ extension HomeStore {
         restoreCommands: [DeviceCommand],
         previousDevices: [SmartDevice],
         deviceCount: Int,
-        habitReceipt: UserHabitMemory.RecordingReceipt? = nil,
         duration: TimeInterval? = nil
     ) {
         let banner = UndoBanner(
             title: title,
             restoreCommands: restoreCommands,
             previousDevices: previousDevices,
-            habitReceipt: habitReceipt,
             duration: duration
         )
         self.undoBanner = banner
+        lastActionUndo = (title, restoreCommands, Date())
         undoTimerTask?.cancel()
         // `duration` overrides the panel's 10/15 s rule for automation, which usually fires while
         // the panel is closed (#59).
@@ -334,28 +302,76 @@ extension HomeStore {
         }
     }
 
-    public func undoTurnAllOff() {
-        guard let banner = undoBanner else { return }
-        lastAssistantUndo = nil
+    @discardableResult
+    public func undoTurnAllOff() -> Task<Void, Never>? {
+        guard let banner = undoBanner else { return nil }
+        lastActionUndo = nil
         undoTimerTask?.cancel()
-        self.undoBanner = nil
+        undoBanner = nil
+        let previous = devices
         let commands = applyUndoCommands(banner.restoreCommands)
-
-        if let receipt = banner.habitReceipt {
-            var memory = userHabitMemory
-            memory.unrecord(receipt)
-            userHabitMemory = memory
-        }
-
         let context = controlContextID
-        Task {
-            for cmd in commands {
-                guard context == controlContextID else { return }
-                try? await executeDeviceCommand(cmd)
-            }
-            guard context == controlContextID else { return }
-            showToast(L10n.tr("已恢复关闭前的状态", "Restored previous device states"))
+        return Task { await restoreDeviceCommands(commands, previousSnapshot: previous, context: context) }
+    }
+
+    public func undoLastAction() async {
+        guard let last = lastActionUndo, Date().timeIntervalSince(last.at) <= Self.undoWindow else {
+            lastActionUndo = nil
+            showToast(L10n.tr("没有可以撤销的操作", "Nothing to undo"), isError: true)
+            return
         }
+        lastActionUndo = nil
+        undoTimerTask?.cancel()
+        undoBanner = nil
+        await restoreDeviceCommands(last.restore)
+    }
+
+    private func restoreDeviceCommands(
+        _ commands: [DeviceCommand],
+        previousSnapshot: [SmartDevice]? = nil,
+        context: UUID? = nil
+    ) async {
+        let context = context ?? controlContextID
+        var failures: [String] = []
+        for command in commands {
+            guard context == controlContextID else { return }
+            guard let idx = devices.firstIndex(where: { Self.undoEffect(of: command, on: $0) != nil }) else { continue }
+            let previous = previousSnapshot?.first(where: { $0.id == devices[idx].id }) ?? devices[idx]
+            if previousSnapshot == nil { _ = applyUndoCommands([command]) }
+            do {
+                try await executeDeviceCommand(command)
+            } catch {
+                guard context == controlContextID else { return }
+                if let index = devices.firstIndex(where: { $0.id == previous.id }) { devices[index] = previous }
+                optimisticLockUntil.removeValue(forKey: previous.id)
+                if !failures.contains(previous.name) { failures.append(previous.name) }
+            }
+        }
+        guard context == controlContextID else { return }
+        if failures.isEmpty {
+            showToast(L10n.tr("已恢复操作前的状态", "Restored previous device states"))
+        } else {
+            showToast(L10n.tr("部分设备撤销失败：", "Undo failed for: ") + failures.joined(separator: L10n.tr("、", ", ")), isError: true)
+        }
+    }
+
+    private func finishBatchAction(failedIds: Set<String>, previous: [SmartDevice], bannerId: UUID) {
+        guard !failedIds.isEmpty, undoBanner?.id == bannerId else { return }
+        for device in previous where failedIds.contains(device.id) {
+            if let index = devices.firstIndex(where: { $0.id == device.id }) { devices[index] = device }
+            optimisticLockUntil.removeValue(forKey: device.id)
+        }
+        let failedDevices = previous.filter { failedIds.contains($0.id) }
+        undoBanner?.restoreCommands.removeAll { command in
+            failedDevices.contains { Self.undoEffect(of: command, on: $0) != nil }
+        }
+        if let commands = undoBanner?.restoreCommands, !commands.isEmpty {
+            lastActionUndo?.restore = commands
+        } else {
+            undoBanner = nil
+            lastActionUndo = nil
+        }
+        showToast(L10n.tr("部分设备未响应，已回滚：", "Failed devices rolled back: ") + failedDevices.map(\.name).joined(separator: L10n.tr("、", ", ")), isError: true)
     }
 
     func applyUndoCommands(_ commands: [DeviceCommand]) -> [DeviceCommand] {

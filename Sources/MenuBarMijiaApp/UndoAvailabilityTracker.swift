@@ -10,7 +10,7 @@ import Observation
 final class UndoAvailabilityTracker {
     static let shared = UndoAvailabilityTracker()
 
-    /// Same window as `HomeStore.voiceUndoWindow` (10 minutes).
+    /// Same window as `HomeStore.undoWindow` (10 minutes).
     static let window: TimeInterval = 10 * 60
 
     private(set) var lastActionAt: Date?
@@ -35,10 +35,10 @@ final class UndoAvailabilityTracker {
         }
     }
 
-    /// Shared button action for the AI bar and the panel footer.
+    /// Shared button action for the undo button and the panel footer.
     func performUndo(store: HomeStore) async {
         syncAction(at: nil)
-        _ = await store.runAssistantCommand(L10n.tr("撤销", "undo"))
-        syncAction(at: store.lastAssistantActionAt)
+        await store.undoLastAction()
+        syncAction(at: store.lastActionAt)
     }
 }

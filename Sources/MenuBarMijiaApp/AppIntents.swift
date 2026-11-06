@@ -5,7 +5,7 @@ import MijiaCore
 // MARK: - App Intents (#57)
 //
 // Every intent executes through the same HomeStore entry points as the panel, so optimistic
-// updates, optimistic locking, habit recording, and undo stay consistent with manually clicking a
+// updates, optimistic locking, and undo stay consistent with manually clicking a
 // tile. Parameter lists come from the live store, which means Shortcuts/Siri only offer devices,
 // scenes, and rooms that exist in the connected home.
 //
@@ -250,31 +250,6 @@ struct RunSceneIntent: AppIntent {
     }
 }
 
-struct AskAssistantIntent: AppIntent {
-    static let title: LocalizedStringResource = "一句话控制"
-    static let description: IntentDescription? = IntentDescription(
-        "用一句自然语言控制设备；与 AI 栏共用本地解析、云端回退和撤销。"
-    )
-
-    @Parameter(title: "指令")
-    var text: String
-
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let utterance = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !utterance.isEmpty else {
-            return .result(dialog: intentDialog(L10n.tr(
-                "请先说一句要执行的家居指令",
-                "Say a smart-home command first"
-            )))
-        }
-
-        try await HomeStore.shared.waitForInitialSnapshot()
-        let message = await askAssistant(utterance)
-        await notifyExternalAction(message)
-        return .result(dialog: intentDialog(message))
-    }
-}
-
 struct GetRoomClimateIntent: AppIntent {
     static let title: LocalizedStringResource = "查询房间温湿度"
     static let description: IntentDescription? = IntentDescription(
@@ -334,12 +309,6 @@ struct MenuBarMijiaAppShortcuts: AppShortcutsProvider {
                 systemImageName: "sparkles"
             ),
             AppShortcut(
-                intent: AskAssistantIntent(),
-                phrases: ["用 \(.applicationName) 执行家居指令"],
-                shortTitle: "一句话控制",
-                systemImageName: "text.bubble"
-            ),
-            AppShortcut(
                 intent: GetRoomClimateIntent(),
                 phrases: ["用 \(.applicationName) 查询房间温湿度"],
                 shortTitle: "房间温湿度",
@@ -351,36 +320,7 @@ struct MenuBarMijiaAppShortcuts: AppShortcutsProvider {
 
 // MARK: - Helpers
 
-/// Runs a natural-language command through the AI bar's entry point on the main actor and reduces
-/// the store state to one line, so Shortcuts/Siri can show it as the intent result.
-@MainActor
-private func askAssistant(_ utterance: String) async -> String {
-    let store = HomeStore.shared
-    let plan = await store.runAssistantCommand(utterance)
-
-    if store.pendingCloudConsent != nil {
-        // The consent card lives in the assistant bar; open it so the user can allow this request.
-        store.presentAssistantBar()
-        HotkeyAndNotificationManager.shared.ensureMenuBarExtraWindowVisible()
-        return L10n.tr(
-            "这条指令需要云端 AI。请在 MenuBarMijia 面板里确认后重试。",
-            "This command needs cloud AI. Confirm it in the MenuBarMijia panel and try again."
-        )
-    }
-    if let plan, !plan.reply.isEmpty {
-        return plan.reply
-    }
-    switch store.assistantState {
-    case .done(let reply), .failed(let reply), .awaitingChoice(let reply):
-        return reply
-    case .thinking:
-        return L10n.tr("正在执行…", "Working…")
-    case .idle:
-        return L10n.tr("没有找到可执行的设备操作", "No matching device actions")
-    }
-}
-
-/// Runtime text (device names, assistant replies) is not a compile-time localization key, but
+/// Runtime text (device names, action results) is not a compile-time localization key, but
 /// `IntentDialog` only accepts `LocalizedStringResource`; a literal resource falls back to the text
 /// when no catalog entry exists.
 private func intentDialog(_ text: String) -> IntentDialog {

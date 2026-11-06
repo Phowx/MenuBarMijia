@@ -4,8 +4,8 @@ import Testing
 
 /// Regression coverage for audit items #33–#36, #47, #50 and #53 (MijiaCore side).
 struct AuditWave2Tests {
-    static let studyCeiling = AssistantTests.studyCeiling
-    static let studyDesk = AssistantTests.studyDesk
+    static let studyCeiling = DeviceFixtures.studyCeiling
+    static let studyDesk = DeviceFixtures.studyDesk
 
     static func light(
         id: String,
@@ -55,169 +55,6 @@ struct AuditWave2Tests {
     }
 
     // MARK: - #33: every controllable device reaches the model
-
-    @Test("System One requests include a decision head for the 12th device")
-    func systemOneDecisionHeadsAreNotTruncated() async throws {
-        let devices = (1...12).map { idx in
-            Self.light(
-                id: "light_\(idx)",
-                name: "灯\(idx)",
-                roomId: "room_\(idx)",
-                roomName: "房间\(idx)"
-            )
-        }
-        let emptyAnswers = try JSONSerialization.data(withJSONObject: ["answers": [String: Any]()])
-
-        let resolver = ModelIntentResolver(
-            config: AssistantConfig(
-                baseURL: "https://openrouter.ai/api/v1",
-                model: "~typesafe/jev-latest",
-                apiKey: "test-token"
-            ),
-            transport: { request in
-                let body = try #require(request.httpBody.flatMap {
-                    try JSONSerialization.jsonObject(with: $0) as? [String: Any]
-                })
-                let questions = try #require(body["questions"] as? [String: Any])
-                let deviceHeads = questions.keys.filter { $0.hasPrefix("dev_") }
-                #expect(deviceHeads.count == 12)
-                #expect(questions["dev_d12"] != nil)
-                return (emptyAnswers, HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
-            }
-        )
-
-        _ = try await resolver.resolve("全屋准备一下", devices: devices, scenes: [])
-        _ = try await resolver.recommendProactiveSuggestions(
-            devices: devices,
-            scenes: [],
-            context: AssistantContext()
-        )
-    }
-
-    // MARK: - #34: habit learning only follows explicit user actions
-
-    @Test("Plain local commands are learned and a spoken undo takes the habit back")
-    @MainActor
-    func localCommandHabitsRollBackOnUndo() async throws {
-        let (store, _) = try await makeStore(devices: [Self.studyCeiling, Self.studyDesk])
-
-        _ = await store.runAssistantCommand("打开书房灯")
-        #expect(store.userHabitMemory.entries.count == 2)
-        #expect(store.userHabitMemory.phrases.count == 1)
-
-        _ = await store.runAssistantCommand("撤销")
-        #expect(store.userHabitMemory.entries.isEmpty)
-        #expect(store.userHabitMemory.phrases.isEmpty)
-        let allOff = store.devices.allSatisfy { !$0.isActiveOn }
-        #expect(allOff)
-    }
-
-    @Test("Undoing the assistant banner also takes the habit records back")
-    @MainActor
-    func assistantBannerUndoRestoresHabits() async throws {
-        let (store, _) = try await makeStore(devices: [Self.studyCeiling, Self.studyDesk])
-        _ = await store.runAssistantCommand("打开书房灯")
-        #expect(store.userHabitMemory.entries.count == 2)
-        let banner = try #require(store.undoBanner)
-        #expect(banner.habitReceipt != nil)
-
-        store.undoTurnAllOff()
-        #expect(store.userHabitMemory.entries.isEmpty)
-        #expect(store.userHabitMemory.phrases.isEmpty)
-    }
-
-    @Test("An AI-inferred plan does not create habits, even before undo")
-    @MainActor
-    func aiAutomaticExecutionIsNotLearned() async throws {
-        let (store, _) = try await makeStore(devices: [Self.studyCeiling])
-        let content = #"{"actions":[{"device":"d1","op":"power","value":true}],"reply":"已打开书房吸顶灯"}"#
-        store.assistantResolverOverride = ModelIntentResolver(
-            config: AssistantConfig(model: "glm-5.1"),
-            transport: { request in
-                let data = try JSONSerialization.data(withJSONObject: ["choices": [["message": ["content": content]]]])
-                return (data, HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
-            }
-        )
-
-        let plan = try #require(await store.runAssistantCommand("我要睡觉了"))
-        #expect(plan.source == .model)
-        #expect(store.devices.first?.isActiveOn == true)
-        #expect(store.userHabitMemory.entries.isEmpty)
-        #expect(store.userHabitMemory.phrases.isEmpty)
-
-        _ = await store.runAssistantCommand("撤销")
-        #expect(store.userHabitMemory.entries.isEmpty)
-        #expect(store.userHabitMemory.phrases.isEmpty)
-    }
-
-    @Test("A tapped suggestion counts as a manual action and is learned")
-    @MainActor
-    func tappedSuggestionIsLearned() async throws {
-        let (store, _) = try await makeStore(devices: [Self.studyCeiling])
-        await store.applyAssistantSuggestion(
-            AssistantSuggestion(
-                id: "tap:1",
-                title: "打开书房吸顶灯",
-                intents: [DeviceIntent(targetId: Self.studyCeiling.id, operation: .power(true))]
-            )
-        )
-        #expect(store.userHabitMemory.entries.count == 1)
-    }
-
-    @Test("A fired timer and a missed-timer replay never learn habits")
-    @MainActor
-    func scheduledExecutionsAreNotLearned() async throws {
-        let suite = "test.auditwave2.schedule.\(UUID().uuidString)"
-        let (store, _) = try await makeStore(
-            devices: [Self.studyCeiling],
-            suite: suite
-        )
-        store.assistantSleep = { _ in }
-        store.assistantNow = { Date() }
-
-        _ = await store.runAssistantCommand("10秒后打开书房灯")
-        for _ in 0..<200 {
-            if store.devices.first?.isActiveOn == true { break }
-            try await Task.sleep(for: .milliseconds(10))
-        }
-        #expect(store.devices.first?.isActiveOn == true)
-        #expect(store.userHabitMemory.entries.isEmpty)
-
-        // A timer that came due while the app was away is replayed through the same path.
-        let plan = IntentPlan(
-            intents: [DeviceIntent(targetId: Self.studyCeiling.id, operation: .power(false))],
-            reply: "关闭书房吸顶灯",
-            source: .local
-        )
-        let entry = ScheduledCommand(reply: "关闭书房吸顶灯", fireDate: Date().addingTimeInterval(-120), plan: plan)
-        let defaults = try #require(UserDefaults(suiteName: suite))
-        ScheduledCommand.save([entry], to: defaults)
-        store.restoreScheduledCommands(now: Date())
-        #expect(store.missedScheduledCommands.count == 1)
-
-        _ = await store.runMissedScheduledCommand(id: entry.id)
-        #expect(store.devices.first?.isActiveOn == false)
-        #expect(store.userHabitMemory.entries.isEmpty)
-    }
-
-    @Test("Unrecording a repeat restores the previous count instead of deleting the habit")
-    func habitReceiptRestoresPreviousCount() {
-        var memory = UserHabitMemory()
-        let intent = DeviceIntent(targetId: Self.studyCeiling.id, operation: .power(true))
-        memory.record(utterance: "开灯", intents: [intent], devices: [Self.studyCeiling], scenes: [])
-        let receipt = memory.record(utterance: "开灯", intents: [intent], devices: [Self.studyCeiling], scenes: [])
-        #expect(memory.entries.first?.count == 2)
-        #expect(memory.phrases.first?.count == 2)
-
-        if let receipt {
-            memory.unrecord(receipt)
-        }
-        #expect(memory.entries.count == 1)
-        #expect(memory.entries.first?.count == 1)
-        #expect(memory.phrases.first?.count == 1)
-    }
-
-    // MARK: - #35: long-running plugs and persisted battery cooldowns
 
     @Test("A 5W plug never triggers the long-running reminder; a high-power plug does")
     @MainActor
@@ -504,48 +341,6 @@ struct AuditWave2Tests {
         #expect(hasDemoDevices)
     }
 
-    @Test("Demo mode never calls the cloud assistant, even with an API key configured (#47)")
-    @MainActor
-    func demoModeStaysOfflineForAssistant() async throws {
-        let suite = "test.auditwave2.demo.offline.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suite))
-        defaults.set(HomeBackend.demo.rawValue, forKey: "home_backend")
-        let store = HomeStore(defaultsSuiteName: suite)
-        try await waitForDevices(store, count: 10)
-        store.assistantConfig = AssistantConfig(
-            baseURL: "https://openrouter.ai/api/v1", model: "~typesafe/jev-latest", apiKey: "test-key"
-        )
-        store.assistantTransportOverride = { request in
-            Issue.record("演示模式不应发起任何云端请求：\(request.url?.absoluteString ?? "?")")
-            throw URLError(.badServerResponse)
-        }
-        // 本地解析不了的句子：演示模式直接给出本地提示，不碰云端。
-        let plan = await store.runAssistantCommand("随口说一句解析不了的话xyzzy")
-        #expect(plan == nil)
-        if case .failed(let message) = store.assistantState {
-            #expect(message.contains("演示模式") || message.contains("Demo"))
-        } else {
-            Issue.record("期望演示模式的本地解析失败提示，实际：\(store.assistantState)")
-        }
-        // 主动建议同样不触发云端（上面的 override 一旦被调用就会记录 Issue 使测试失败）。
-        await store.requestProactiveJevSuggestions()
-        let connection = await store.verifyAssistantConfig(store.assistantConfig)
-        #expect(!connection.isSuccess)
-        #expect(connection.message.contains("演示模式") || connection.message.contains("Demo"))
-    }
-
     // MARK: - #50: privacy-first speech default
 
-    @Test("On-device speech defaults on but an explicit opt-out survives relaunch")
-    @MainActor
-    func onDeviceSpeechDefaultAndOptOut() async throws {
-        let suite = "test.auditwave2.speech.\(UUID().uuidString)"
-        let mock = MockHomeProvider()
-        let first = HomeStore(provider: mock, defaultsSuiteName: suite)
-        #expect(first.prefersOnDeviceSpeech == true)
-
-        first.prefersOnDeviceSpeech = false
-        let second = HomeStore(provider: mock, defaultsSuiteName: suite)
-        #expect(second.prefersOnDeviceSpeech == false)
-    }
 }

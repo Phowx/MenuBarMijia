@@ -2,8 +2,7 @@ import Foundation
 import Testing
 @testable import MijiaCore
 
-/// #59: automation executions go through HomeStore's normal dispatch path, never train habits, and
-/// offer undo even for a single device.
+/// #59: automation executions go through HomeStore's normal dispatch path, offer undo even for a single device.
 struct AutomationExecutionTests {
     static let studyLight = SmartDevice(
         id: "light_study",
@@ -50,7 +49,7 @@ struct AutomationExecutionTests {
         return (store, mock)
     }
 
-    @Test("A device rule runs through the store, keeps its undo banner, and records no habit")
+    @Test("A device rule runs through the store, keeps its undo banner, without a language parser")
     @MainActor
     func deviceAutomation() async throws {
         let (store, mock) = try await makeStore()
@@ -66,9 +65,6 @@ struct AutomationExecutionTests {
         #expect(store.undoBanner?.restoreCommands == [
             .setLightPower(entityId: "light.study", isOn: true)
         ])
-        // Automation is not a habit signal (#34).
-        #expect(store.userHabitMemory.entries.isEmpty)
-        #expect(store.userHabitMemory.phrases.isEmpty)
         let commands = await mock.executedCommands
         #expect(commands == [.setLightPower(entityId: "light.study", isOn: false)])
     }
@@ -85,7 +81,6 @@ struct AutomationExecutionTests {
         let commands = await mock.executedCommands
         #expect(commands == [.activateScene(entityId: "scene.home")])
         #expect(store.undoBanner == nil)
-        #expect(store.userHabitMemory.entries.isEmpty)
     }
 
     @Test("Banner undo consumes the command so a second undo cannot overwrite a later manual change")
@@ -97,7 +92,7 @@ struct AutomationExecutionTests {
             title: "锁屏关灯"
         )
         store.undoTurnAllOff()
-        #expect(store.lastAssistantActionAt == nil)
+        #expect(store.lastActionAt == nil)
         for _ in 0..<50 {
             if await mock.executedCommands.count >= 2 { break }
             try await Task.sleep(for: .milliseconds(10))
@@ -105,7 +100,7 @@ struct AutomationExecutionTests {
         let light = try #require(store.devices.first(where: { $0.id == Self.studyLight.id }))
         let task = try #require(store.togglePrimary(light))
         #expect(await task.value)
-        await store.runAssistantCommand("撤销")
+        await store.undoLastAction()
         #expect(store.devices.first(where: { $0.id == Self.studyLight.id })?.isActiveOn == false)
         #expect(await mock.executedCommands == [
             .setLightPower(entityId: "light.study", isOn: false),

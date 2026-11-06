@@ -10,17 +10,14 @@ import Foundation
 public enum AppURLCommand: Equatable, Sendable {
     case toggle(deviceId: String)
     case scene(name: String)
-    case ask(text: String)
 }
 
 /// Parses `menumijia://toggle?device=<id>`, `menumijia://scene?name=<scene>`,
-/// and `menumijia://ask?text=<sentence>`.
+/// only. Natural-language `ask` links from older versions are rejected.
 ///
-/// All parameters are required and trimmed. Long values are rejected instead of being forwarded to
-/// the cloud assistant, so a stray/malicious link cannot turn into an unbounded request.
+/// Parameters are required, trimmed and length-limited.
 public enum AppURLParser {
     public static let scheme = "menumijia"
-    public static let maximumAskLength = 500
     public static let maximumNameLength = 200
     public static let maximumURLLength = 4096
 
@@ -53,9 +50,6 @@ public enum AppURLParser {
         case "scene":
             guard let name = query["name"], name.count <= maximumNameLength else { return nil }
             return .scene(name: name)
-        case "ask":
-            guard let text = query["text"], text.count <= maximumAskLength else { return nil }
-            return .ask(text: text)
         default:
             return nil
         }

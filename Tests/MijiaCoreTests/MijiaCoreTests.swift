@@ -421,7 +421,7 @@ struct MijiaCoreTests {
 
     @Test("Device aliases update HomeStore device names, work with voice/text commands, and preserve original Mi Home names")
     @MainActor
-    func deviceAliasesUpdateStoreAndAssistantCommands() async throws {
+    func deviceAliasesUpdateStoreAndSearch() async throws {
         let splitSwitch = SmartDevice(
             id: "dev_split_2",
             name: "领普三键开关（中键）",
@@ -445,8 +445,9 @@ struct MijiaCoreTests {
         #expect(store.devices.first?.name == "餐边柜射灯")
         #expect(store.originalDeviceName(for: "dev_split_2") == "领普三键开关（中键）")
 
-        let plan = await store.runAssistantCommand("打开餐边柜射灯")
-        #expect(plan?.intents.count == 1)
+        let matches = PanelSearch.results("餐边柜射灯", devices: store.devices)
+        let task = matches.first.flatMap { store.togglePrimary($0) }
+        #expect(await task?.value == true)
         #expect(store.devices.first?.isActiveOn == true)
 
         store.applyDeviceAliases([:])

@@ -44,6 +44,18 @@ struct SnapshotTests {
 
     // MARK: - Device cards: light / climate / plug / sensor / TV
 
+    @Test("The dashboard keeps its controls reachable at compact and freely enlarged sizes")
+    func resizedPanelSnapshots() async throws {
+        let fixture = try await SnapshotFixture()
+        defer { fixture.restore() }
+        for (name, size) in [
+            ("minimum", CGSize(width: 340, height: 360)),
+            ("wide", CGSize(width: 520, height: 700))
+        ] {
+            assertRendered(snapshotReady(ControlCenterPanel(store: fixture.store)), size: size, named: name)
+        }
+    }
+
     @Test("Five device card families render")
     func deviceCardSnapshots() async throws {
         let fixture = try await SnapshotFixture()
@@ -123,7 +135,7 @@ struct SnapshotTests {
     func settingsSnapshots() async throws {
         let fixture = try await SnapshotFixture()
         defer { fixture.restore() }
-        for tab in [SettingsTab.general, .connection, .assistant, .appearance, .privacy, .about] {
+        for tab in [SettingsTab.general, .connection, .appearance, .privacy, .about] {
             for scheme in [ColorScheme.light, .dark] {
                 assertRendered(
                     SettingsWindowView(store: fixture.store, selectedTab: tab)
@@ -204,6 +216,30 @@ struct SnapshotTests {
     }
 
     // MARK: - Non-visual guards for the appearance work (#51) and tooltip (#54)
+
+    @Test("Retired timers show a readable archive and an explicit cleanup action")
+    func retiredTimersSnapshot() async throws {
+        let suite = "test.snapshot.retired.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        let previousLanguage = L10n.currentLanguage
+        defer {
+            defaults.removePersistentDomain(forName: suite)
+            L10n.currentLanguage = previousLanguage
+        }
+        L10n.currentLanguage = .zhHans
+        let records: [[String: Any]] = [[
+            "id": "A3F286F1-7EA1-4B1B-A66F-2B0B4F60AC31",
+            "reply": "30 分钟后关闭书房台灯",
+            "fireDate": 815_961_600.0
+        ]]
+        defaults.set(try JSONSerialization.data(withJSONObject: records), forKey: "assistant_scheduled_commands_v1")
+        let store = HomeStore(provider: MockHomeProvider(), defaultsSuiteName: suite)
+        assertRendered(
+            snapshotReady(RetiredTimersSection(store: store).padding(14)),
+            size: CGSize(width: 740, height: 320),
+            named: "retired-timers-light"
+        )
+    }
 
     @Test("On and off tiles never share the same ink or fill")
     func platterContrastHoldsInBothSchemes() {

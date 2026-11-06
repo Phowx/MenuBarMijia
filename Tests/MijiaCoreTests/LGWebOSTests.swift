@@ -83,9 +83,9 @@ struct LGWebOSTests {
         #expect(LGWebOSConfig.load(from: defaults).clientKey.isEmpty)
     }
 
-    @Test("HomeStore TV controls and voice assistant commands work with LG C2 TV")
+    @Test("HomeStore TV controls and structured actions work with LG C2 TV")
     @MainActor
-    func storeTVControlsAndAssistant() async throws {
+    func storeTVControlsAndActions() async throws {
         let lgTV = SmartDevice(
             id: LGWebOSProtocol.deviceId,
             name: "LG C2 电视",
@@ -109,10 +109,9 @@ struct LGWebOSTests {
             try await Task.sleep(for: .milliseconds(10))
         }
 
-        // 1. Voice command "打开电视"
-        let onPlan = try #require(await store.runAssistantCommand("打开电视"))
-        #expect(onPlan.source == .local)
-        #expect(onPlan.reply == "已打开LG C2 电视")
+        // 1. Explicit structured power action
+        let onPlan = await store.runAutomation(intents: [.init(targetId: LGWebOSProtocol.deviceId, operation: .power(true))], title: "打开电视")
+        #expect(onPlan.reply == "打开电视")
         #expect(store.devices.first?.isActiveOn == true)
 
         // 2. Mute, OLED Screen Off, and HDMI Source Switch

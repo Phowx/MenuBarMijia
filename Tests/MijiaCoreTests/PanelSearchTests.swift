@@ -171,53 +171,6 @@ struct PanelSearchTests {
         #expect(PanelSearch.matches("kt", entries: entries).first?.deviceId == Self.livingLight.id)
     }
 
-    // MARK: - Return: filter or command
-
-    private func kind(_ query: String) -> PanelQueryKind {
-        PanelSearch.kind(of: query, devices: Self.devices, scenes: [])
-    }
-
-    @Test("A device name or room is a filter, never a command")
-    func namesAndRoomsFilter() {
-        #expect(kind("书房灯") == .filter)
-        #expect(kind("sfd") == .filter)
-        #expect(kind("书房") == .filter)
-        #expect(kind("sf") == .filter)
-        #expect(kind("客厅") == .filter)
-    }
-
-    @Test("Instructions are commands, so Return hands them to the assistant")
-    func instructionsAreCommands() {
-        #expect(kind("打开客厅灯") == .command)
-        #expect(kind("书房灯调到 30") == .command)
-        #expect(kind("26 度") == .command)
-        #expect(kind("亮度 60%") == .command)
-        #expect(kind("关闭空调") == .command)
-        #expect(kind("把客厅灯调暗") == .command)
-        #expect(kind("undo") == .command)
-        #expect(kind("撤销") == .command)
-        #expect(kind("5 分钟后关灯") == .command)
-        #expect(kind("turn on the study light") == .command)
-    }
-
-    @Test("A device literally named like a verb stays selectable")
-    func deviceNamedLikeAVerbStillFilters() {
-        let tricky = SmartDevice(
-            id: "light_tricky", name: "调光灯", roomId: "study", roomName: "书房",
-            model: "yeelink.light.lamp4", isOnline: true,
-            kind: .light(LightSpec(entityId: "light.tricky", isOn: true))
-        )
-        #expect(PanelSearch.kind(of: "调光灯", devices: [tricky], scenes: []) == .filter)
-        // An instruction that merely starts the same way is still a command.
-        #expect(PanelSearch.kind(of: "调光灯调到 50", devices: [tricky], scenes: []) == .command)
-    }
-
-    @Test("A scene name is a command (it activates the scene)")
-    func sceneNamesRun() {
-        let scene = HomeScene(id: "scene_movie", name: "观影模式", entityId: "scene.movie")
-        #expect(PanelSearch.kind(of: "观影模式", devices: Self.devices, scenes: [scene]) == .command)
-    }
-
     // MARK: - Keyboard rules
 
     private func action(
@@ -227,7 +180,6 @@ struct PanelSearchTests {
         isFieldFocused: Bool = false,
         hasSelection: Bool = false,
         hasExplicitSelection: Bool = false,
-        queryKind: PanelQueryKind = .filter
     ) -> PanelSearchAction {
         PanelSearch.action(for: key, context: PanelSearchContext(
             query: query,
@@ -235,7 +187,6 @@ struct PanelSearchTests {
             isFieldFocused: isFieldFocused,
             hasSelection: hasSelection,
             hasExplicitSelection: hasExplicitSelection,
-            queryKind: queryKind
         ))
     }
 
@@ -245,10 +196,10 @@ struct PanelSearchTests {
         #expect(action(.init(kind: .character("书"))) == .appendQuery("书"))
         #expect(action(.init(kind: .character("1"))) == .ignore)
         #expect(action(.init(kind: .character(" "))) == .ignore)
-        // `/` opens the assistant bar and `v` starts dictation; ⌘F is the way in for those.
-        #expect(action(.init(kind: .character("/"))) == .ignore)
-        #expect(action(.init(kind: .character("v"))) == .ignore)
-        #expect(action(.init(kind: .character("V"))) == .ignore)
+        // Former language shortcuts now enter ordinary search.
+        #expect(action(.init(kind: .character("/"))) == .appendQuery("/"))
+        #expect(action(.init(kind: .character("v"))) == .appendQuery("v"))
+        #expect(action(.init(kind: .character("V"))) == .appendQuery("V"))
         // Once a query exists, digits are part of it (e.g. `客厅灯2`).
         #expect(action(.init(kind: .character("2")), query: "客厅灯") == .appendQuery("2"))
         #expect(action(.init(kind: .character("v")), query: "tv") == .appendQuery("v"))
@@ -278,20 +229,19 @@ struct PanelSearchTests {
         #expect(action(.init(kind: .up)) == .ignore)
     }
 
-    @Test("Return toggles the highlighted device, runs a command, or does nothing")
+    @Test("Return only toggles a selected device; an unmatched sentence does nothing")
     func returnTogglesOrRuns() {
         #expect(action(.init(kind: .return), query: "sfd", hasSelection: true) == .toggleSelection)
         #expect(
-            action(.init(kind: .return), query: "打开客厅灯", hasSelection: true, queryKind: .command) == .runCommand
+            action(.init(kind: .return), query: "打开客厅灯", hasSelection: false) == .ignore
         )
-        // Picking a device by hand beats the command reading.
+        // An explicit selected search result can still be toggled.
         #expect(
             action(
                 .init(kind: .return),
                 query: "打开客厅灯",
                 hasSelection: true,
-                hasExplicitSelection: true,
-                queryKind: .command
+                hasExplicitSelection: true
             ) == .toggleSelection
         )
         #expect(action(.init(kind: .return), query: "zzz", hasSelection: false) == .ignore)

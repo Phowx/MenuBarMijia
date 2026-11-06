@@ -18,8 +18,6 @@ public struct UndoBanner: Equatable, Sendable {
     public var title: String
     public var restoreCommands: [DeviceCommand]
     public var previousDevices: [SmartDevice]
-    /// Habit records written while executing this action; undoing the banner takes them back (#34).
-    public var habitReceipt: UserHabitMemory.RecordingReceipt?
     /// Explicit window for actions outside the panel (automation, #59); nil uses the device-count rule.
     public var duration: TimeInterval?
 
@@ -28,14 +26,12 @@ public struct UndoBanner: Equatable, Sendable {
         title: String,
         restoreCommands: [DeviceCommand],
         previousDevices: [SmartDevice],
-        habitReceipt: UserHabitMemory.RecordingReceipt? = nil,
         duration: TimeInterval? = nil
     ) {
         self.id = id
         self.title = title
         self.restoreCommands = restoreCommands
         self.previousDevices = previousDevices
-        self.habitReceipt = habitReceipt
         self.duration = duration
     }
 }
@@ -132,19 +128,8 @@ public final class HomeStore {
         }
     }
 
-    /// When off, nothing new is learned and no habit summary is sent to the AI model.
-    public var isHabitLearningEnabled: Bool = true {
-        didSet { userDefaults.set(isHabitLearningEnabled, forKey: "assistant_habit_learning_enabled") }
-    }
-
     /// Test seam for the manual-control debounce window (sliders fire continuously, #113).
     var controlDebounceInterval: Duration = .milliseconds(280)
-
-    /// Ask macOS to keep speech recognition on this Mac (no audio sent to Apple) when the language supports it.
-    /// Defaults on for privacy; an explicitly saved `false` still wins (#50).
-    public var prefersOnDeviceSpeech: Bool = true {
-        didSet { userDefaults.set(prefersOnDeviceSpeech, forKey: "assistant_on_device_speech") }
-    }
 
     /// Persisted flag set once the user finishes or dismisses the first-launch onboarding guide.
     public var hasCompletedOnboarding: Bool = false {
@@ -202,16 +187,9 @@ public final class HomeStore {
     public static let cameraStreamURLsKey = "camera_stream_urls_v1"
     public static let automaticUpdateCheckInterval: TimeInterval = 6 * 3600
     public internal(set) var updateState: AppUpdateState = .idle
-    public var automaticallyChecksForUpdates: Bool = true {
-        didSet {
-            userDefaults.set(automaticallyChecksForUpdates, forKey: "automatically_checks_for_updates")
-            if automaticallyChecksForUpdates && !oldValue {
-                Task { @MainActor [weak self] in
-                    await self?.checkForUpdatesIfNeeded()
-                }
-            }
-        }
-    }
+    /// Legacy updater helpers remain independently testable; this personal app has no update
+    /// UI or background checker, and never restores a previous build's automatic-update opt-in.
+    public var automaticallyChecksForUpdates: Bool = false
     public var onTerminateForUpdate: (() -> Void)?
     public var updater: AppUpdater
     /// Local energy history fed by provider snapshots (#62).
@@ -277,7 +255,8 @@ public final class HomeStore {
         let boolOrDefaultTrue = { (key: String) -> Bool in
             ud.object(forKey: key) == nil ? true : ud.bool(forKey: key)
         }
-        self.automaticallyChecksForUpdates = boolOrDefaultTrue("automatically_checks_for_updates")
+        self.automaticallyChecksForUpdates = false
+        ud.removeObject(forKey: "automatically_checks_for_updates")
 
         let savedLangPref = ud.string(forKey: "app_language").flatMap(AppLanguagePreference.init(rawValue:)) ?? .system
         self.appLanguagePreference = savedLangPref
@@ -304,9 +283,6 @@ public final class HomeStore {
         self.selectedMiHomeId = ud.string(forKey: MiCloudProvider.selectedHomeKey)
         self.lgConfig = LGWebOSConfig.load(from: ud)
         self.homeName = ud.string(forKey: "home_name") ?? KeychainHelper.localizedDefaultHomeName
-        self.isHabitLearningEnabled = boolOrDefaultTrue("assistant_habit_learning_enabled")
-        // Privacy-first default: ask for on-device recognition unless the user explicitly opted out (#50).
-        self.prefersOnDeviceSpeech = boolOrDefaultTrue("assistant_on_device_speech")
         self.hasCompletedOnboarding = ud.bool(forKey: "has_completed_onboarding")
         self.hideOfflineDevices = ud.bool(forKey: "hide_offline_devices")
         self.enableGlobalHotkey = boolOrDefaultTrue("enable_global_hotkey")
@@ -359,7 +335,9 @@ public final class HomeStore {
         }
         syncSensorHistoryScope()
         startListening()
-        restoreScheduledCommands()
+        retiredTimerData = userDefaults.data(forKey: RetiredAssistantData.timerStorageKey)
+        RetiredAssistantData.cleanPreferences(in: ud)
+        if !isTestEnvironment { RetiredAssistantData.cleanCredentials() }
         // Demo mode is strictly offline: no LAN discovery, no LG connection (#47).
         if provider == nil, initialBackend != .demo {
             startLGWebOSIfNeeded()
@@ -414,62 +392,17 @@ public final class HomeStore {
         optimisticLockUntil[deviceId] = ContinuousClock.now.advanced(by: duration)
     }
 
-    // MARK: - Assistant Commands & Personalized Jev Context
+    // A button-based undo remains available after the short banner expires.
+    var lastActionUndo: (title: String, restore: [DeviceCommand], at: Date)?
+    public var lastActionAt: Date? { lastActionUndo?.at }
+    static let undoWindow: TimeInterval = 10 * 60
 
-    public var isShowingAssistantBar: Bool = false
-    /// Bumped to ask an already-visible command bar to take keyboard focus.
-    public internal(set) var assistantFocusRequest: Int = 0
-    /// Bumped to ask the command bar to start or toggle live speech recognition.
-    public internal(set) var assistantVoiceRequest: Int = 0
-    public internal(set) var assistantState: AssistantState = .idle
-    /// Receipt for the latest command, cleared as soon as the reply resets (#93).
-    public internal(set) var lastAssistantReceipt: AssistantExecutionReceipt?
-    /// A command or suggestion request waiting for the user to allow sending it to a cloud AI service (#20).
-    public internal(set) var pendingCloudConsent: PendingCloudConsent?
-    public internal(set) var assistantSuggestions: [AssistantSuggestion] = []
-    /// Cached model proactive recommendations for `lastProactiveRefreshSignature` (#113).
-    var aiProactiveSuggestions: [AssistantSuggestion]?
-    public internal(set) var isProactiveRecommending: Bool = false
-    /// Ambient signature (time bucket + rounded readings) the suggestion cache was built from (#113).
-    var lastProactiveRefreshSignature: String?
-    /// Earliest moment a failed background refresh may retry (Codex #116 review).
-    var proactiveRetryEarliest: Date?
-    /// Cooldown before a failed background refresh retries; test seam.
-    var proactiveRetryCooldown: TimeInterval = 300
-    /// The running silent refresh, exposed so tests can await it.
-    var proactiveRefreshTask: Task<Void, Never>?
-    /// Whether the GrokBall star stage with its 4 radial suggestions is open (#114).
-    public internal(set) var isGrokBallStageExpanded: Bool = false
-    /// GrokBall shows `33` (confetti) until this moment after a successful control (#114).
-    public internal(set) var grokBallCelebrationUntil: Date?
-    var grokBallCelebrationTask: Task<Void, Never>?
-    var assistantResetTask: Task<Void, Never>?
-    /// Test seam replacing the network resolver built from `assistantConfig`.
-    var assistantResolverOverride: ModelIntentResolver?
-    /// Test seam replacing only the HTTP transport while still resolving `assistantConfig` from `userDefaults`.
-    var assistantTransportOverride: ModelIntentResolver.Transport?
-    /// Commands waiting on a spoken delay ("10 分钟后关灯"), soonest first. Persisted across launches.
-    public internal(set) var scheduledCommands: [ScheduledCommand] = []
-    /// Timers that came due while the app was closed or the Mac slept. Never auto-executed without user confirmation.
-    public internal(set) var missedScheduledCommands: [ScheduledCommand] = []
-    public var onMissedScheduledCommand: ((ScheduledCommand) -> Void)?
-    var notifiedMissedTimerIds: Set<UUID> = []
-    var scheduledTasks: [UUID: Task<Void, Never>] = [:]
-    /// The most recent assistant action, kept so "撤销" can restore it after the 5 s banner is gone.
-    var lastAssistantUndo: (
-        reply: String,
-        restore: [DeviceCommand],
-        previous: [SmartDevice],
-        at: Date,
-        habitReceipt: UserHabitMemory.RecordingReceipt?
-    )?
-    public var lastAssistantActionAt: Date? { lastAssistantUndo?.at }
-    /// How long a spoken "撤销" can still reach back.
-    static let voiceUndoWindow: TimeInterval = 10 * 60
-    /// Test seam for the delay before a scheduled command fires.
-    var assistantSleep: @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
-    /// Test seam for "now" when a timer wakes up, so a Mac that slept through it can be simulated.
-    var assistantNow: @Sendable () -> Date = { Date() }
-    /// A timer that wakes up later than this (the Mac slept, the app was frozen) waits for the user (#22).
-    static let lateTimerGrace: TimeInterval = 60
+    /// Legacy language-created timers are never scheduled by this build. Keep the original
+    /// bytes until the user explicitly clears them, including malformed records.
+    public internal(set) var retiredTimerData: Data?
+    public var retiredTimers: [RetiredTimer] { RetiredAssistantData.timers(from: retiredTimerData) }
+    public func clearRetiredTimers() {
+        userDefaults.removeObject(forKey: RetiredAssistantData.timerStorageKey)
+        retiredTimerData = nil
+    }
 }

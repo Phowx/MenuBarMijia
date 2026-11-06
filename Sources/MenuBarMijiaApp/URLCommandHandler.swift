@@ -6,7 +6,7 @@ import MijiaCore
 ///
 /// Web pages can navigate to a custom scheme without a verifiable user gesture, so each control
 /// action is shown in an app-modal confirmation sheet unless the user turned on “允许 URL 直控”.
-/// The sheet names the device and the exact action (turn on/off, run scene, run command) so the
+/// The sheet names the device and the exact action (turn on/off, run scene) so the
 /// user is never asked to approve an opaque request.
 @MainActor
 final class URLCommandHandler {
@@ -15,7 +15,6 @@ final class URLCommandHandler {
     private enum Resolved {
         case toggle(SmartDevice)
         case scene(HomeScene)
-        case ask(String)
     }
 
     private var pendingURLs: [URL] = []
@@ -72,8 +71,7 @@ final class URLCommandHandler {
             guard confirm(description(for: resolved)) else { return }
         }
 
-        // Show the panel before a possibly slow assistant request so the user sees progress and
-        // the resulting undo banner in the same place.
+        // Show the panel so external actions and their feedback are visible.
         HotkeyAndNotificationManager.shared.ensureMenuBarExtraWindowVisible()
         await execute(resolved, store: store)
     }
@@ -95,8 +93,6 @@ final class URLCommandHandler {
                 return nil
             }
             return .scene(scene)
-        case .ask(let text):
-            return .ask(text)
         }
     }
 
@@ -121,8 +117,6 @@ final class URLCommandHandler {
             )
         case .scene(let scene):
             return L10n.format("触发场景「%@」", "Run scene \"%@\"", scene.name)
-        case .ask(let text):
-            return L10n.format("执行指令：「%@」", "Run command: \"%@\"", text)
         }
     }
 
@@ -209,34 +203,6 @@ final class URLCommandHandler {
                     ? L10n.format("已触发场景：%@", "Activated scene: %@", scene.name)
                     : L10n.format("场景「%@」执行失败", "Scene \"%@\" failed", scene.name)
             )
-        case .ask(let text):
-            let plan = await store.runAssistantCommand(text)
-            let state = store.assistantState
-            if store.pendingCloudConsent != nil {
-                // The consent card lives in the assistant bar; open it so the user can allow the
-                // request the link asked for.
-                store.presentAssistantBar()
-                finish(
-                    L10n.tr(
-                        "这条指令需要云端 AI。请在面板里确认后重试。",
-                        "This command needs cloud AI. Confirm it in the panel and try again."
-                    ),
-                    store: store
-                )
-            } else if let plan, !plan.reply.isEmpty {
-                finish(plan.reply, store: store)
-            } else {
-                switch state {
-                case .failed(let reason):
-                    finish(reason, isError: true, store: store)
-                case .done(let reply), .awaitingChoice(let reply):
-                    finish(reply, store: store)
-                case .thinking:
-                    finish(L10n.tr("正在执行…", "Working…"), store: store)
-                case .idle:
-                    finish(L10n.tr("没有找到可执行的设备操作", "No matching device actions"), store: store)
-                }
-            }
         }
     }
 

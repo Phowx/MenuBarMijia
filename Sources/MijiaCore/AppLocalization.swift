@@ -107,8 +107,6 @@ public struct AppLanguage: RawRepresentable, Hashable, Identifiable, Codable, Se
 
     public var nativeName: String { L10n.nativeName(for: self) }
 
-    public var speechLocaleIdentifier: String { L10n.speechLocaleIdentifier(for: self) }
-
     /// Every language the app can actually show: the two built-in ones plus every resource table.
     public static var allCases: [AppLanguage] { L10n.availableLanguages }
 
@@ -317,7 +315,6 @@ public enum L10n {
 
         let language: AppLanguage
         let nativeName: String
-        let speechLocale: String?
         let order: Int
         let strings: [String: String]
         let patterns: [Pattern]
@@ -338,7 +335,6 @@ public enum L10n {
     private struct TableFile: Decodable {
         let id: String
         let nativeName: String?
-        let speechLocale: String?
         let order: Int?
         let strings: [String: String]?
     }
@@ -383,16 +379,6 @@ public enum L10n {
         case .zhHans: return "简体中文"
         case .zhHant: return "繁體中文"
         case .en: return "English"
-        default: return language.rawValue
-        }
-    }
-
-    public static func speechLocaleIdentifier(for language: AppLanguage) -> String {
-        if let spoken = translationTables()[language]?.speechLocale, !spoken.isEmpty { return spoken }
-        switch language {
-        case .zhHans: return "zh-CN"
-        case .zhHant: return "zh-TW"
-        case .en: return "en-US"
         default: return language.rawValue
         }
     }
@@ -560,7 +546,6 @@ public enum L10n {
             tables[language] = TranslationTable(
                 language: language,
                 nativeName: decoded.nativeName ?? language.rawValue,
-                speechLocale: decoded.speechLocale,
                 order: decoded.order ?? 100,
                 strings: strings.filter { !$0.key.contains("*") },
                 patterns: patterns

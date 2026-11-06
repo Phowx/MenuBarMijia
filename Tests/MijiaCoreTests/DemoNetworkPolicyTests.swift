@@ -4,6 +4,25 @@ import Testing
 
 struct DemoNetworkPolicyTests {
     @MainActor
+    @Test("The personal build never restores the original automatic update opt-in")
+    func previousUpdateOptInIsRetired() async throws {
+        let suite = "test.personal.updates.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(true, forKey: "automatically_checks_for_updates")
+        var driver = UpdateSystemDriver.live
+        driver.fetchData = { _ in
+            Issue.record("Personal build attempted a background release request")
+            throw URLError(.notConnectedToInternet)
+        }
+        let store = HomeStore(provider: MockHomeProvider(), defaultsSuiteName: suite, updater: AppUpdater(driver: driver))
+        #expect(!store.automaticallyChecksForUpdates)
+        #expect(defaults.object(forKey: "automatically_checks_for_updates") == nil)
+        await store.checkForUpdatesIfNeeded()
+        #expect(store.updateState == .idle)
+    }
+
+    @MainActor
     @Test("Demo mode blocks manual and automatic updates as well as queued downloads")
     func updatesRemainOffline() async throws {
         let suite = "test.demo.updates.\(UUID().uuidString)"

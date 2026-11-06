@@ -157,7 +157,6 @@ extension HomeStore {
             if homes != snapshot.homes { homes = snapshot.homes }
             if environmentReadings != snapshot.environmentReadings {
                 environmentReadings = snapshot.environmentReadings
-                maybeRefreshProactiveSuggestionsInBackground()
             }
             if pendingLegacyMenuBarTargetMigration,
                let first = snapshot.environmentReadings.first(where: { $0.temperature != nil }) {
@@ -202,7 +201,6 @@ extension HomeStore {
                     handler(alert)
                 }
             }
-            notifyMissedScheduledCommandsIfNeeded()
         }
     }
 

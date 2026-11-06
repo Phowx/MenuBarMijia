@@ -44,20 +44,19 @@ public struct ControlCenterPanel: View {
 
     /// Card sizes are remembered per page: a room id, or "all" for the overview.
     private var layoutScope: String { store.selectedRoomId ?? "all" }
-    @AppStorage(PanelHeight.storageKey) private var panelHeightRaw: String = PanelHeight.standard.rawValue
     @AppStorage(AppAppearance.storageKey) private var appearanceRaw: String = AppAppearance.system.rawValue
     @Namespace private var roomPillNamespace
     public let store: HomeStore
+    private let onQuit: @MainActor () -> Void
 
-    private static let panelWidth: CGFloat = 376
-    private var panelHeight: CGFloat { (PanelHeight(rawValue: panelHeightRaw) ?? .standard).points }
     private var appearance: AppAppearance { AppAppearance(rawValue: appearanceRaw) ?? .system }
     /// The panel sets `panelRoot` on its own body, so it cannot read that environment back;
     /// resolve the effective scheme locally (#51).
     private var effectiveScheme: ColorScheme { appearance.colorScheme ?? colorScheme }
 
-    public init(store: HomeStore) {
+    public init(store: HomeStore, onQuit: @escaping @MainActor () -> Void = { NSApplication.shared.terminate(nil) }) {
         self.store = store
+        self.onQuit = onQuit
     }
     public var body: some View {
         let _ = (store.effectiveLanguage, store.selectedRoomId, store.rooms.count)
@@ -113,21 +112,17 @@ public struct ControlCenterPanel: View {
                 isEditingLayout = true
             }
         }
-        .frame(width: Self.panelWidth, height: panelHeight)
-        .onChange(of: panelHeightRaw) { _, _ in syncMenuBarWindowSize() }
-        .onChange(of: store.lastAssistantActionAt) { _, date in
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .overlay(alignment: .bottomTrailing) {
+            PanelResizeHandle()
+                .frame(width: 18, height: 18)
+                .padding(2)
+                .accessibilityLabel(L10n.tr("调整面板大小", "Resize Panel"))
+        }
+        .onChange(of: store.lastActionAt) { _, date in
             UndoAvailabilityTracker.shared.syncAction(at: date)
         }
-        .onChange(of: store.assistantState) { _, state in
-            switch state {
-            case .done:
-                SoundFeedback.playSuccess()
-            case .failed:
-                SoundFeedback.playFailure()
-            default:
-                break
-            }
-        }
+
         // #45: the only place that sees every error toast is the panel root.
         .onChange(of: store.toastNotice?.id) { _, _ in
             AppDiagnosticsLog.shared.record(store.toastNotice)
@@ -138,13 +133,12 @@ public struct ControlCenterPanel: View {
         }
         // Frequently opened utility: show immediately, including keyboard invocation.
         .onReceive(NotificationCenter.default.publisher(for: MenuBarPanelController.didShowNotification)) { _ in
-            UndoAvailabilityTracker.shared.syncAction(at: store.lastAssistantActionAt)
+            UndoAvailabilityTracker.shared.syncAction(at: store.lastActionAt)
             isPresented = true
         }
         .onAppear {
-            UndoAvailabilityTracker.shared.syncAction(at: store.lastAssistantActionAt)
+            UndoAvailabilityTracker.shared.syncAction(at: store.lastActionAt)
             SettingsWindowOpener.shared.open = { openSettings() }
-            syncMenuBarWindowSize()
             isPresented = true
         }
         // The panel tree survives a close, so a half-typed query would come back on the next open.
@@ -163,13 +157,6 @@ public struct ControlCenterPanel: View {
         .transaction { if reduceMotion { $0.disablesAnimations = true } }
         .environment(\.isEditingLayout, isEditingLayout)
         .panelRoot()
-        .task {
-            await store.checkForUpdatesIfNeeded()
-        }
-    }
-
-    private func syncMenuBarWindowSize() {
-        MenuBarPanelController.shared.updatePanelSize(width: Self.panelWidth, height: panelHeight)
     }
 
     // MARK: - Main Dashboard
@@ -180,13 +167,6 @@ public struct ControlCenterPanel: View {
                 .padding(.horizontal, 14)
                 .padding(.top, 12)
                 .padding(.bottom, 8)
-
-            if store.isShowingAssistantBar {
-                AssistantCommandBar(store: store)
-                    .padding(.horizontal, 14)
-                    .padding(.bottom, 8)
-                    .transition(AppleMotion.drawerTransition)
-            }
 
             if let suggestion = store.pendingHAAddressSuggestion {
                 haAddressSuggestionBanner(suggestion)
@@ -271,9 +251,9 @@ public struct ControlCenterPanel: View {
 
             footerBar
                 .padding(.horizontal, 14)
-                .padding(.vertical, 9)
+                .padding(.top, 9)
+                .padding(.bottom, 19)
         }
-        .animation(AppleMotion.snappySpring, value: store.isShowingAssistantBar)
     }
 
     // MARK: - Search (#60)
@@ -344,17 +324,14 @@ public struct ControlCenterPanel: View {
         return count == 1 ? L10n.tr("1 台", "1 device") : L10n.tr("\(count) 台", "\(count) devices")
     }
 
-    /// Return inside the field: same rules as the global key monitor (toggle, or run an instruction).
+    /// Return inside the field: same device-selection rules as the global key monitor.
     private func submitSearch() {
         let results = searchResults
         if search.isExplicitSelection, let device = search.selected(in: results) {
             toggleSearchResult(device)
             return
         }
-        if PanelSearch.kind(of: search.query, devices: store.devices, scenes: store.scenes) == .command {
-            PanelSearchKeyboard.runCommand(search.query, store: store, state: search)
-            return
-        }
+
         guard let device = search.selected(in: results) else { return }
         toggleSearchResult(device)
     }
@@ -374,17 +351,11 @@ public struct ControlCenterPanel: View {
                 Text(L10n.tr("没有匹配的设备", "No matching devices"))
                     .font(.system(size: DesignTokens.TypeSize.body, weight: .semibold))
                     .foregroundStyle(.primary)
-                if PanelSearch.kind(of: search.query, devices: store.devices, scenes: store.scenes) == .command {
-                    Text(L10n.tr("回车把这句交给助手执行", "Press Return to run this as a command"))
-                        .font(.system(size: DesignTokens.TypeSize.caption))
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text(search.query.isEmpty
-                        ? L10n.tr("输入设备名、房间或拼音首字母", "Type a device, room or pinyin initials")
-                        : L10n.tr("试试房间名「书房」或首字母「sfd」", "Try a room (书房) or initials (sfd)"))
-                        .font(.system(size: DesignTokens.TypeSize.caption))
-                        .foregroundStyle(.secondary)
-                }
+                Text(search.query.isEmpty
+                    ? L10n.tr("输入设备名、房间或拼音首字母", "Type a device, room or pinyin initials")
+                    : L10n.tr("试试房间名「书房」或首字母「sfd」", "Try a room (书房) or initials (sfd)"))
+                    .font(.system(size: DesignTokens.TypeSize.caption))
+                    .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, 30)
@@ -1023,58 +994,6 @@ public struct ControlCenterPanel: View {
 
                 Spacer(minLength: 6)
 
-                Button {
-                    withAnimation(AppleMotion.snappySpring) {
-                        store.presentAssistantBar(startVoice: true)
-                    }
-                } label: {
-                    Image(systemName: "mic.fill")
-                        .font(.system(size: DesignTokens.TypeSize.caption, weight: .semibold))
-                        .foregroundStyle(Color.primary.opacity(0.78))
-                        .frame(width: 26, height: 24)
-                        .adaptiveGlass(in: Capsule(style: .continuous), interactive: true)
-                        .listeningPulse(SpeechInputController.shared.isListening, color: .accentColor)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel(Text(L10n.tr("语音指令", "Voice command")))
-                .accessibilityHint(Text(L10n.tr("点击后直接说话控制设备", "Click, then speak to control devices")))
-                .panelHelp(L10n.tr("语音指令：点击直接说话控制设备（快捷键 V）", "Voice command: click to speak (shortcut V)"))
-
-                Button {
-                    withAnimation(AppleMotion.snappySpring) {
-                        if store.isShowingAssistantBar {
-                            store.dismissAssistantBar()
-                        } else {
-                            store.presentAssistantBar()
-                        }
-                    }
-                } label: {
-                    Image(systemName: "sparkles")
-                        .font(.system(size: DesignTokens.TypeSize.caption, weight: .semibold))
-                        .foregroundStyle(store.isShowingAssistantBar ? Color.white : Color.primary.opacity(0.78))
-                        .frame(width: 26, height: 24)
-                        .background {
-                            if store.isShowingAssistantBar {
-                                Capsule(style: .continuous)
-                                    .fill(Color.accentColor)
-                                    .shadow(color: Color.accentColor.opacity(0.35), radius: 4, y: 1.5)
-                            }
-                        }
-                        .modifier(
-                            ChipSurface(
-                                shape: Capsule(style: .continuous),
-                                tint: nil,
-                                interactive: true,
-                                clear: false,
-                                isHidden: store.isShowingAssistantBar
-                            )
-                        )
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel(Text(L10n.tr("AI 指令", "AI command")))
-                .accessibilityHint(Text(L10n.tr("用一句话控制设备", "Control devices with natural language")))
-                .panelHelp(L10n.tr("AI 指令：用一句话控制设备（快捷键 /）", "AI command: control devices with natural language (shortcut /)"))
-
                 if isEditingLayout {
                     doneEditingButton
                         .transition(.scale(scale: 0.8).combined(with: .opacity))
@@ -1575,7 +1494,7 @@ public struct ControlCenterPanel: View {
             .adaptiveGlass(in: bannerShape)
             .shadow(color: .black.opacity(0.18), radius: 10, x: 0, y: 4)
             .padding(.horizontal, 14)
-            .padding(.bottom, 42)
+            .padding(.bottom, 52)
             // #53: reading the banner must not cost the undo. Leaving restarts the full window.
             .onHover { hovering in
                 if hovering {
@@ -1600,7 +1519,7 @@ public struct ControlCenterPanel: View {
             .padding(.vertical, 7)
             .adaptiveGlass(in: toastShape)
             .shadow(color: .black.opacity(0.15), radius: 8, x: 0, y: 3)
-            .padding(.bottom, 42)
+            .padding(.bottom, 52)
             .transition(AppleMotion.drawerTransition)
         }
     }
@@ -1622,47 +1541,10 @@ public struct ControlCenterPanel: View {
 
             Spacer()
 
-            if let release = store.updateState.badgeRelease {
-                Button {
-                    if store.updateState.isReadyToRelaunch {
-                        withAnimation(AppleMotion.snappySpring) {
-                            store.confirmRelaunchForUpdate()
-                        }
-                    } else {
-                        SettingsWindowOpener.shared.show(tab: .about)
-                    }
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(
-                            systemName: store.updateState.isReadyToRelaunch
-                                ? "arrow.triangle.2.circlepath.circle.fill"
-                                : "arrow.down.circle.fill"
-                        )
-                        .font(.system(size: DesignTokens.TypeSize.caption, weight: .semibold))
-                        Text(updateBadgeTitle(for: release))
-                        .font(.system(size: DesignTokens.TypeSize.caption, weight: .semibold))
-                        .monospacedDigit()
-                    }
-                }
-                .buttonStyle(
-                    PillActionButtonStyle(
-                        isSelected: true,
-                        tintColor: store.updateState.isReadyToRelaunch ? .green : .accentColor
-                    )
-                )
-                .panelHelp(
-                    store.updateState.isReadyToRelaunch
-                        ? L10n.tr("点击立即重启并完成 v\(release.version) 更新", "Click to relaunch and finish updating to v\(release.version)")
-                        : L10n.tr("发现新版本 v\(release.version)，点击直接打开更新", "New version v\(release.version) available")
-                )
-            }
-
-            // #53: once the banner is gone the assistant action is still undoable for ten minutes.
+            // #53: once the banner is gone the action is still undoable for ten minutes.
             if store.undoBanner == nil,
-               !store.isShowingAssistantBar,
                UndoAvailabilityTracker.shared.isAvailable {
                 Button {
-                    store.presentAssistantBar()
                     Task { await UndoAvailabilityTracker.shared.performUndo(store: store) }
                 } label: {
                     Image(systemName: "arrow.uturn.backward")
@@ -1673,7 +1555,7 @@ public struct ControlCenterPanel: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(Text(L10n.tr("撤销上一步", "Undo last action")))
-                .panelHelp(L10n.tr("撤销上一步（10 分钟内有效）", "Undo the last assistant action (valid for 10 minutes)"))
+                .panelHelp(L10n.tr("撤销上一步（10 分钟内有效）", "Undo the last action (valid for 10 minutes)"))
             }
 
             // #60: the panel has no visible search field until you type, so the footer advertises it.
@@ -1717,28 +1599,24 @@ public struct ControlCenterPanel: View {
             .buttonStyle(.plain)
             .accessibilityLabel(Text(L10n.tr("打开设置", "Open Settings")))
             .panelHelp(L10n.tr("偏好设置与连接配置（⌘,）", "Preferences & connection settings (⌘,)"))
+            Button {
+                onQuit()
+            } label: {
+                Image(systemName: "power")
+                    .font(.system(size: DesignTokens.TypeSize.body, weight: .semibold))
+                    .foregroundStyle(.primary.opacity(0.72))
+                    .frame(width: 24, height: 22)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(Text(L10n.tr("退出 MenuBarMijia", "Quit MenuBarMijia")))
+            .panelHelp(L10n.tr("退出 MenuBarMijia", "Quit MenuBarMijia"))
         }
     }
 
     /// `openSettings` is the supported way to reveal the Settings scene from a MenuBarExtra.
     private func presentSettingsWindow() {
         SettingsWindowOpener.shared.show()
-    }
-
-    private func updateBadgeTitle(for release: AppRelease) -> String {
-        switch store.updateState {
-        case .readyToRelaunch:
-            return L10n.tr("重启更新 v\(release.version)", "Relaunch v\(release.version)")
-        case .downloading(_, let progress):
-            if let fraction = progress.fractionCompleted {
-                return L10n.tr("下载 \(Int(fraction * 100))%", "DL \(Int(fraction * 100))%")
-            }
-            return L10n.tr("下载中…", "Downloading…")
-        case .verifying:
-            return L10n.tr("校验中…", "Verifying…")
-        default:
-            return L10n.tr("更新 v\(release.version)", "Update v\(release.version)")
-        }
     }
 
     private var statusDotColor: Color {
@@ -1862,7 +1740,7 @@ final class PanelSearchState {
 /// Routes key presses into the panel's search before the panel's own shortcuts run (#60).
 ///
 /// Returns `true` when the key belonged to the search and must not reach the existing keyboard
-/// ladder (device focus, quick-index digits, "/" for the assistant, "v" for dictation). With no
+/// ladder (device focus and quick-index digits). With no
 /// search open and nothing typed, every key returns `false`, so the panel behaves exactly as before.
 @MainActor
 enum PanelSearchKeyboard {
@@ -1894,7 +1772,7 @@ enum PanelSearchKeyboard {
         return PanelSearchKey(kind: kind, hasCommand: command, hasControl: control, hasOption: option)
     }
 
-    /// A text field other than the search field (assistant bar, layout rename) owns the keyboard.
+    /// A text field other than the search field (layout rename) owns the keyboard.
     private static var isOtherFieldFocused: Bool {
         guard let responder = NSApp.keyWindow?.firstResponder else { return false }
         return responder is NSTextView || responder is NSTextField
@@ -1907,7 +1785,7 @@ enum PanelSearchKeyboard {
         guard MenuBarPanelController.shared.isPanelWindow(NSApp.keyWindow) else { return false }
         guard let key = key(for: event) else { return false }
 
-        // A text field that is not the search field (assistant bar, layout rename) owns the keyboard.
+        // A text field that is not the search field (layout rename) owns the keyboard.
         if isOtherFieldFocused, !state.isFieldFocused { return false }
 
         let results = state.isSearching ? state.results(store: store) : []
@@ -1916,10 +1794,7 @@ enum PanelSearchKeyboard {
             isSearching: state.isSearching,
             isFieldFocused: state.isFieldFocused,
             hasSelection: state.selected(in: results) != nil,
-            hasExplicitSelection: state.isExplicitSelection,
-            queryKind: state.isSearching
-                ? PanelSearch.kind(of: state.query, devices: store.devices, scenes: store.scenes)
-                : .filter
+            hasExplicitSelection: state.isExplicitSelection
         )
 
         switch PanelSearch.action(for: key, context: context) {
@@ -1962,21 +1837,7 @@ enum PanelSearchKeyboard {
             withAnimation(AppleMotion.snappySpring) { store.toggleExpanded(device.id) }
             return true
 
-        case .runCommand:
-            runCommand(state.query, store: store, state: state)
-            return true
         }
     }
 
-    /// Return on an instruction: the pre-typed query goes through the same path as the assistant bar,
-    /// so local parsing, demo mode, API keys and cloud consent all behave as before.
-    static func runCommand(_ text: String, store: HomeStore, state: PanelSearchState = .shared) {
-        let utterance = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !utterance.isEmpty else { return }
-        state.end()
-        store.presentAssistantBar()
-        Task { @MainActor in
-            await store.runAssistantCommand(utterance)
-        }
-    }
 }
