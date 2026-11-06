@@ -154,22 +154,6 @@ struct KeychainCredentialTests {
         #expect(defaults.object(forKey: MiSessionStore.fallbackDefaultsKey) == nil)
     }
 
-    @Test("Startup migration reads exactly the plaintext keys that ≤1.0.6 wrote")
-    func migrationCoversLegacyKeys() {
-        #expect(KeychainHelper.legacyPlaintextTokenKey == "ha_fallback_token")
-        #expect(MiSessionStore.fallbackDefaultsKey == "mi_session_fallback_v1")
-        #expect(LGWebOSConfig.clientKeyDefaultsKey == "lg_webos_client_key")
-        #expect(LGWebOSConfig.clientKeyAccount == "lg_webos_client_key")
-        #expect(KeychainHelper.secretFallbackKey(for: "assistant_api_key_openrouter_jev")
-            == "keychain_fallback_assistant_api_key_openrouter_jev")
-
-        // The assistant sweep covers every provider slot plus the pre-v1.0.4 OpenRouter slot.
-        #expect(KeychainHelper.assistantSecretAccounts.contains(KeychainHelper.assistantAPIKeyAccount))
-        for preset in AssistantProviderPreset.allCases {
-            #expect(KeychainHelper.assistantSecretAccounts.contains(KeychainHelper.assistantProviderAPIKeyAccount(for: preset)))
-        }
-    }
-
     @Test("A custom suite keeps the test store in UserDefaults and leaves the Keychain alone")
     func suiteSeamStaysOutOfTheKeychain() throws {
         let suite = "com.jryang1997.MenuBarMijia.keychain-seam.\(UUID().uuidString)"

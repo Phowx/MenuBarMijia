@@ -2,34 +2,61 @@ import SwiftUI
 import AppKit
 import MijiaCore
 
-// MARK: - Panel Height
+// MARK: - Remembered Panel Size
 
-/// User-chosen panel height; `.max` fills the screen below the menu bar.
-public enum PanelHeight: String, CaseIterable, Identifiable, Sendable {
-    case compact, standard, tall, max
+/// Window dimensions are independent of card layout and are only written after a user resize.
+/// Screen changes clamp the displayed size without overwriting the remembered preference.
+enum PanelSizePreferences {
+    static let widthKey = "panel_width_points"
+    static let heightKey = "panel_height_points"
+    static let legacyHeightKey = "panel_height"
+    static let defaultSize = NSSize(width: 376, height: 560)
+    static let minimumSize = NSSize(width: 340, height: 360)
 
-    public static let storageKey = "panel_height"
-
-    public var id: String { rawValue }
-
-    public var title: String {
-        switch self {
-        case .compact: return L10n.tr("紧凑", "Compact")
-        case .standard: return L10n.tr("标准", "Standard")
-        case .tall: return L10n.tr("加高", "Tall")
-        case .max: return L10n.tr("最大", "Max")
-        }
+    static func constrained(_ size: NSSize, available: NSSize) -> NSSize {
+        let width = size.width.isFinite && size.width > 0 ? size.width : defaultSize.width
+        let height = size.height.isFinite && size.height > 0 ? size.height : defaultSize.height
+        let maxWidth = max(1, available.width)
+        let maxHeight = max(1, available.height)
+        return NSSize(
+            width: min(max(width, minimumSize.width), maxWidth).rounded(),
+            height: min(max(height, minimumSize.height), maxHeight).rounded()
+        )
     }
 
-    @MainActor
-    public var points: CGFloat {
-        let screen = (NSScreen.main?.visibleFrame.height ?? 900) - 40
-        switch self {
-        case .compact: return 460
-        case .standard: return Swift.min(560, screen)
-        case .tall: return Swift.min(680, screen)
-        case .max: return Swift.max(460, screen)
+    static func load(from defaults: UserDefaults, available: NSSize) -> NSSize {
+        let width = (defaults.object(forKey: widthKey) as? NSNumber)?.doubleValue ?? defaultSize.width
+        let height: CGFloat
+        if let saved = defaults.object(forKey: heightKey) as? NSNumber {
+            height = saved.doubleValue
+        } else {
+            switch defaults.string(forKey: legacyHeightKey) {
+            case "compact": height = 460
+            case "tall": height = 680
+            case "max": height = max(460, available.height - 16)
+            default: height = defaultSize.height
+            }
         }
+        return constrained(NSSize(width: width, height: height), available: available)
+    }
+
+    static func save(_ size: NSSize, to defaults: UserDefaults) {
+        guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0 else { return }
+        defaults.set(size.width, forKey: widthKey)
+        defaults.set(size.height, forKey: heightKey)
+    }
+
+    static func reset(in defaults: UserDefaults) {
+        for key in [widthKey, heightKey, legacyHeightKey] { defaults.removeObject(forKey: key) }
+    }
+
+    static func draggedFrame(from start: NSRect, delta: NSSize, visibleFrame: NSRect) -> NSRect {
+        let limits = visibleFrame.insetBy(dx: 8, dy: 8)
+        let top = min(start.maxY, limits.maxY)
+        let available = NSSize(width: limits.width, height: top - limits.minY)
+        let size = constrained(NSSize(width: start.width + delta.width, height: start.height + delta.height), available: available)
+        let x = min(max(start.minX, limits.minX), limits.maxX - size.width)
+        return NSRect(x: x, y: top - size.height, width: size.width, height: size.height)
     }
 }
 

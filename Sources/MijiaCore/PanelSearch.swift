@@ -37,12 +37,6 @@ public struct DeviceSearchEntry: Equatable, Sendable {
     }
 }
 
-/// Whether Return on the query toggles the selected device or hands the text to the assistant.
-public enum PanelQueryKind: Equatable, Sendable {
-    case filter
-    case command
-}
-
 /// A key press reduced to what the search field cares about, so the decision rules stay in
 /// `MijiaCore` and are testable without AppKit.
 public struct PanelSearchKey: Equatable, Sendable {
@@ -89,9 +83,6 @@ public enum PanelSearchAction: Equatable, Sendable {
     case moveSelection(Int)
     case toggleSelection
     case expandSelection
-    /// Hand the query to the assistant (local parser first, then the model with its usual consent
-    /// and demo-mode guards).
-    case runCommand
     case appendQuery(String)
     case deleteBackward
 }
@@ -106,22 +97,19 @@ public struct PanelSearchContext: Equatable, Sendable {
     public var hasSelection: Bool
     /// The user moved the selection with ↑↓ or a click, so Return acts on it even for a command query.
     public var hasExplicitSelection: Bool
-    public var queryKind: PanelQueryKind
 
     public init(
         query: String,
         isSearching: Bool,
         isFieldFocused: Bool,
         hasSelection: Bool,
-        hasExplicitSelection: Bool = false,
-        queryKind: PanelQueryKind = .filter
+        hasExplicitSelection: Bool = false
     ) {
         self.query = query
         self.isSearching = isSearching
         self.isFieldFocused = isFieldFocused
         self.hasSelection = hasSelection
         self.hasExplicitSelection = hasExplicitSelection
-        self.queryKind = queryKind
     }
 }
 
@@ -272,67 +260,6 @@ public enum PanelSearch {
             .map(\.entry)
     }
 
-    // MARK: - Return: filter or command
-
-    /// Decides what Return does with the query: point at a device, or run it as an instruction.
-    ///
-    /// A name or room the panel can point at always wins, so a device literally called `调光灯`
-    /// stays selectable. Anything the local parser understands — plus an undo word, a delay phrase,
-    /// a command verb or a measurement (`调到 30`, `26 度`, `60%`) — is a command; the panel then
-    /// hands the original text to `HomeStore.runAssistantCommand`, which keeps the existing consent
-    /// and demo-mode guards.
-    public static func kind(
-        of rawQuery: String,
-        devices: [SmartDevice],
-        scenes: [HomeScene],
-        aliases: [String: String] = [:]
-    ) -> PanelQueryKind {
-        let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return .filter }
-
-        // A name or room the panel can point at always wins, so typing a device name never fires a
-        // command; only a longer sentence ("书房灯调到 30") is read as an instruction.
-        let q = normalize(query)
-        let names = devices.compactMap { alias(for: $0, aliases: aliases) ?? $0.name }.map(normalize).filter { !$0.isEmpty }
-        if names.contains(q) { return .filter }
-        if q.count >= 2, names.contains(where: { $0.hasPrefix(q) }) { return .filter }
-
-        let rooms = Set(devices.map { normalize($0.roomName) }).filter { !$0.isEmpty }
-        if rooms.contains(q) { return .filter }
-        if rooms.contains(where: { $0.hasPrefix(q) }) { return .filter }
-
-        if LocalIntentParser.parse(query, devices: devices, scenes: scenes) != nil { return .command }
-        if UndoPhrase.isUndo(query) { return .command }
-        if DelayPhrase.extract(query) != nil { return .command }
-
-        if startsWithCommandVerb(query) { return .command }
-        if mentionsMeasurement(query) { return .command }
-        return .filter
-    }
-
-    private static let commandPrefixes = [
-        "打开", "开启", "关闭", "关掉", "关上", "熄灭", "请", "帮我", "帮忙", "把", "将",
-        "调", "设", "切", "执行", "启动", "运行", "全关", "全开",
-        "turn", "open", "close", "switch", "set", "make", "please", "run", "start",
-        "activate", "enable", "disable", "dim", "brighten"
-    ]
-
-    private static func startsWithCommandVerb(_ query: String) -> Bool {
-        let lower = query.lowercased()
-        return commandPrefixes.contains { lower.hasPrefix($0) }
-    }
-
-    /// `26 度`, `60%`, `4500K`, `调到 30`: a number tied to a unit or a set-verb means an instruction.
-    private static func mentionsMeasurement(_ query: String) -> Bool {
-        let lower = query.lowercased()
-        let unitPattern = #"[0-9]+(\.[0-9]+)?\s*(%|％|度|℃|°c|°f|°|k|档|级)"#
-        let setVerbPattern = #"(调到|调成|调至|调为|调低|调高|设为|设成|设置为|切换到|切到|改成|改为)\s*[0-9]+"#
-        for pattern in [unitPattern, setVerbPattern] where lower.range(of: pattern, options: .regularExpression) != nil {
-            return true
-        }
-        return false
-    }
-
     // MARK: - Keyboard rules
 
     /// What a key press means while the panel is open.
@@ -366,9 +293,6 @@ public enum PanelSearch {
 
         case .return:
             guard searching, hasQuery else { return .ignore }
-            // A device the user picked wins; otherwise an instruction runs as an instruction.
-            if context.hasExplicitSelection, context.hasSelection { return .toggleSelection }
-            if context.queryKind == .command { return .runCommand }
             return context.hasSelection ? .toggleSelection : .ignore
 
         case .right:
@@ -383,11 +307,9 @@ public enum PanelSearch {
             guard !text.isEmpty else { return .ignore }
             // The field editor inserts text itself (that is what keeps IME and paste working).
             if context.isFieldFocused { return .ignore }
-            // Space, 1–9, `/` and `v` are panel shortcuts until a search has actually begun: they are
-            // the quick-index digits, toggle-focused-device, the assistant bar and dictation.
+            // Space and 1–9 remain device shortcuts until search begins.
             if !searching {
                 if text == " " { return .ignore }
-                if text == "/" || text.lowercased() == "v" { return .ignore }
                 if text.count == 1, let digit = text.first, ("1"..."9").contains(digit) { return .ignore }
             }
             return .appendQuery(text)

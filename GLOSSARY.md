@@ -19,12 +19,7 @@ _Avoid_: Device（设备）、Card（卡片）
 _Avoid_: Data mapping（数据映射）、Parsing（解析）
 
 **HomeBackend（连接后端）**：
-驱动 `HomeStore` 的底层数据源配置，支持局域网 `Home Assistant`（`HAWebSocketProvider`）与免网关的 `米家云端直连`（`MiCloudProvider`）；当 macOS 客户端同时配置并登录两端时自动并行连接并合并设备，仅配置一端时单源运行，演示模式由 `DemoHomeProvider` 提供。Windows 采用互斥数据源选择，HA 通过原生 `ha_snapshot`、`ha_execute` 与 `HomeAssistantClient` 接入，不进行双源合并。
-_Avoid_: Server type（服务器类型）、Mode（模式）
-
-**DeviceDeduplication（跨源设备去重合并）**：
-当 Home Assistant 与米家云端同时生效时，按硬件标识（`xiaomi_home` 的 `<server>_<did>`、裸 `did`、MAC 地址）及同房间唯一同款/同名规则识别同一台物理设备，并按「在线状态优先 → 可控能力评分优先 → 同分 Home Assistant 优先」选出单一胜出数据源驱动该 `SmartDevice` 卡片的纯函数合并过程。
-_Avoid_: Cloud sync（云同步）、Entity bridge（实体桥接）
+`HomeStore` 当前选用的数据源：Home Assistant（`HAWebSocketProvider`）、米家云（`MiCloudProvider`）或离线演示（`DemoHomeProvider`）。macOS 当前实现为单源切换，不包含 ADR-0008 描述的双源合并。LG 电视局域网连接是独立的可选控制通道。
 
 **MiSession（米家云端会话）**：
 通过小米账号二维码扫码登录获取并持久化在钥匙串中的会话凭证（含 `userId`、`ssecurity`、`serviceToken` 与区域），用于签名与加解密 `/app/*` 请求。这里的 RC4 是小米云 `api.io.mi.com` 私有接口的**传输层**加密（`MIOT-ENCRYPT-ALGORITHM: ENCRYPT-RC4`），不是端到端加密：指令与状态经小米服务器中转，服务器可读明文。
@@ -57,20 +52,20 @@ _Avoid_: Weather（天气）、Telemetry（遥测）
 _Avoid_: Automation（后台自动化规则）、Macro（宏）
 
 **QuickAction（内置快捷动作）**：
-基于设备类别自动聚合的批量领域指令（如「全屋关灯」「柔和夜灯」「睡眠关温控」），无需在 Home Assistant 预置场景即可一键执行。执行后按设备数给出撤销横幅：1–2 台 10 秒、3 台及以上 15 秒（`HomeStore.undoBannerSeconds(forDeviceCount:)`，指针悬停时暂停）；横幅消失后，助手的最后一次动作仍可用「撤销上一步」在 10 分钟内回滚。
+基于设备类别自动聚合的批量领域指令（如「全屋关灯」「柔和夜灯」「睡眠关温控」），无需在 Home Assistant 预置场景即可一键执行。执行后按设备数给出撤销横幅：1–2 台 10 秒、3 台及以上 15 秒（`HomeStore.undoBannerSeconds(forDeviceCount:)`，指针悬停时暂停）；横幅消失后，仍可点击「撤销上一步」在 10 分钟内回滚。
 _Avoid_: Local scene（本地场景）、Custom script（自定义脚本）
 
 **AllOffTarget（全关目标）**：
 「全关」实际会关闭的设备集合（`HomeStore.allOffTargets`）：当前视图内、开启中、且能从面板关闭的设备。默认不参与全关的类别（插座、扫地机、摄像机，`joinsAllOffByDefault` 返回 false）可由用户按设备覆盖（`setJoinsAllOff`），覆盖结果持久化。
 _Avoid_: All devices（全部设备）
 
-**IntentPlan（意图执行计划）**：
-自然语言指令经本地规则解析（`LocalIntentParser`）或远端大模型回退（`ModelIntentResolver`）后生成的结构化设备操作列表（`[DeviceIntent]`）与简短反馈文案，经能力校验后由 `HomeStore` 并发下发并支持多设备一键撤销。
-_Avoid_: Prompt output（模型输出）、Action script（动作脚本）
+**IntentPlan（操作计划）**：
+用户界面或系统自动化提供的结构化设备操作列表（`[DeviceIntent]`）及反馈标题。`HomeStore+Actions` 校验设备能力，按设备并发下发，维护乐观状态、失败回滚及撤销逆操作。不解析文字或语音，也不调用模型。
 
-**ScheduledCommand（定时指令）**：
-带有绝对触发时刻 `fireDate` 与已解析 `IntentPlan` 的延时控制任务，持久化在本地 `UserDefaults`（`assistant_scheduled_commands_v1`）。应用重启时未到期项按剩余时间继续倒计时；退出期间已过期项转入 `missedScheduledCommands` 待确认队列并保留在磁盘，必须由用户点击「立即执行」或「忽略」后才执行或移除，绝不在后台静默触发过期硬件动作。
-_Avoid_: Background job（后台任务）、Cron（计划任务）
+
+**RetiredTimer（旧版定时记录）**：
+旧文字指令创建的定时摘要，仅用于设置页展示。原始数据保留在 `assistant_scheduled_commands_v1`，本版不解码执行计划、不调度、不补执行，只有用户明确确认才删除记录。
+
 
 **ActiveDevice（活跃开启设备）**：
 当前在线且处于工作状态的受控设备（开着的灯、正在制冷/制热的空调或电暖器、运行中的风扇、通电开启的插座、清扫中的扫地机、播放中的音箱、监控中的摄像机）。顶部「全关」只作用于其中参与全关的 AllOffTarget；插座、扫地机、摄像机等常年通电或看护设备默认不计入全关目标（冰箱、待机电视、纯传感器整体不算活跃设备）。
@@ -84,14 +79,8 @@ _Avoid_: Mini card（迷你卡片）、Widget（小组件）
 macOS 原生通知，覆盖四类情况：插座持续开启 45 分钟且**实时功率超过 300 W**（没有功率读数就不触发）、空调或电暖器连续运行 4 小时、传感器或门锁电量低于 15%、星标设备意外离线。低电量同一设备 24 小时内不重复提醒，冷却时间持久化（重启不重置）；带关闭动作的提醒可在通知上直接执行。
 _Avoid_: Alarm（警报）、Push notification（远程推送）
 
-**ProactiveSuggestion（猜你想控推荐）**：
-结合用户全渠道操作习惯记忆（`UserHabitMemory`，涵盖时段与工作日/周末频次、时间衰减与动作序列预测，见 ADR-0009）、当前环境温湿度与在线设备，立即给出最多四项当前可执行的候选动作（`AssistantSuggestion`）；配置大模型时在后台刷新。动作不足四项时显示实际数量。
-_Avoid_: Static shortcut（静态快捷方式）、Random tip（随机提示）
 
-**GrokBall（AI 情绪表情球）**：
-控制面板外的球面双目动态组件，实时注视光标，并随睡眠、待机、聆听、思考、执行成功与异常状态切换表情；macOS 的默认、好奇和睡眠表情使用黑色球体与白色眼睛，支持自由拖动与长按 0.5 秒进入语音输入。轻点后最多展示四项设备 `ProactiveSuggestion`，macOS 根据球在主面板的左、右、上、下位置向外安排胶囊，并在屏幕边缘调整行列或换向；Windows 保留固定侧挂与纵向推荐。展开不改变主面板卡片布局，设备推荐支持撤销，场景可通过语音或文本指令执行。
-_Avoid_: Static icon（静态图标）、Chatbot avatar（聊天头像）
 
 **ViewPreference（本地视图偏好）**：
-仅作用于当前客户端的展示配置（包括星标常用置顶、自定义分组 `DeviceGroup`、长按拖拽排序、通过编辑态卡片右下角圆弧手柄拖拽或轻点调节的分页面卡片尺寸 `TileSize`、单设备固定数据源覆盖、隐藏特定设备、隐藏离线设备、面板高度 `PanelHeight`、菜单栏常驻指标选择），存储在本地且不回写远端数据源。
+仅作用于当前客户端的展示配置（包括星标常用置顶、自定义分组 `DeviceGroup`、长按拖拽排序、通过编辑态卡片右下角圆弧手柄拖拽或轻点调节的分页面卡片尺寸 `TileSize`、单设备固定数据源覆盖、隐藏特定设备、隐藏离线设备、自动记忆的面板宽高 `PanelSizePreferences`、菜单栏常驻指标选择），存储在本地且不回写远端数据源。
 _Avoid_: Device config（设备配置）、Profile（档案）

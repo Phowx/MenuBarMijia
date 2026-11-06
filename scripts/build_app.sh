@@ -133,7 +133,7 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
     <string>MenuBarMijiaApp</string>
     <key>CFBundleIdentifier</key>
     <string>com.jryang1997.MenuBarMijia</string>
-    <!-- #57 External URL Scheme: menumijia://toggle?device=…, scene?name=…, ask?text=…
+    <!-- #57 External URL Scheme: menumijia://toggle?device=…, scene?name=…
          App Intents themselves need Metadata.appintents, which Xcode's
          appintentsmetadataprocessor emits; SwiftPM does not produce the compiler's const-value
          side outputs, so Shortcuts discovery may require an Xcode-project build. The URL Scheme
@@ -171,10 +171,6 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
     <array>
         <string>_home-assistant._tcp</string>
     </array>
-    <key>NSMicrophoneUsageDescription</key>
-    <string>用于通过语音指令直接控制米家智能家居设备。</string>
-    <key>NSSpeechRecognitionUsageDescription</key>
-    <string>用于将您的中文语音指令实时识别为智能家居控制动作。</string>
     <key>NSAppTransportSecurity</key>
     <dict>
         <key>NSAllowsArbitraryLoads</key>
@@ -189,15 +185,11 @@ PLIST
 mkdir -p "$APP_DIR/Contents/Resources/zh-Hans.lproj"
 cat > "$APP_DIR/Contents/Resources/zh-Hans.lproj/InfoPlist.strings" <<'STRINGS_ZH'
 "NSLocalNetworkUsageDescription" = "用于局域网自动发现并实时连接 Home Assistant 及电视等智能家居设备。";
-"NSMicrophoneUsageDescription" = "用于通过语音指令直接控制米家智能家居设备。";
-"NSSpeechRecognitionUsageDescription" = "用于将您的语音指令实时识别为智能家居控制动作。";
 STRINGS_ZH
 
 mkdir -p "$APP_DIR/Contents/Resources/en.lproj"
 cat > "$APP_DIR/Contents/Resources/en.lproj/InfoPlist.strings" <<'STRINGS_EN'
 "NSLocalNetworkUsageDescription" = "Used to automatically discover and connect to Home Assistant and smart TVs on your local network.";
-"NSMicrophoneUsageDescription" = "Used to control your Xiaomi Home smart devices with voice commands.";
-"NSSpeechRecognitionUsageDescription" = "Used to transcribe your voice commands into smart home actions in real time.";
 STRINGS_EN
 
 # SwiftPM executable targets emit const values through Xcode but do not run the app metadata
@@ -336,7 +328,7 @@ if [ "$SIGN_IDENTITY" = "-" ]; then
     fi
     codesign --force --sign - "$APP_DIR"
 else
-    # 正式签名：开启 Hardened Runtime（苹果公证的前提），并声明麦克风权限。
+    # 正式签名：开启 Hardened Runtime（苹果公证的前提），。
     # 只有 Apple 签发的证书才向苹果申请时间戳；自签名证书没有 Apple 信任链，申请会失败。
     CODESIGN_ARGS=(--force --options runtime)
     if security find-certificate -c "$SIGN_IDENTITY" -p 2>/dev/null \

@@ -17,10 +17,10 @@ struct AppURLCommandTests {
         #expect(AppURLParser.parse(url) == .scene(name: "回家模式"))
     }
 
-    @Test("Ask link keeps the sentence and trims surrounding whitespace")
-    func parsesAsk() throws {
+    @Test("Retired ask links are rejected without parsing or execution")
+    func rejectsRetiredAsk() throws {
         let url = try #require(URL(string: "menumijia://ask?text=%20%E6%89%93%E5%BC%80%E4%B9%A6%E6%88%BF%E7%81%AF%20"))
-        #expect(AppURLParser.parse(url) == .ask(text: "打开书房灯"))
+        #expect(AppURLParser.parse(url) == nil)
     }
 
     @Test("Path-style links are accepted too")
@@ -39,7 +39,7 @@ struct AppURLCommandTests {
             "menumijia://scene?name=",
             "menumijia://ask?text=",
             "menumijia://unknown?device=light_bed",
-            "menumijia://ask?text=" + String(repeating: "a", count: AppURLParser.maximumAskLength + 1)
+            "menumijia://ask?text=" + String(repeating: "a", count: 500 + 1)
         ]
         for raw in bad {
             let url = try #require(URL(string: raw), "invalid test URL \(raw)")

@@ -95,9 +95,6 @@ public enum KeychainHelper {
         // Only the app's own domain ever held these keys; a test suite must never write production accounts.
         guard defaults === UserDefaults.standard else { return }
         migratePlaintextSecret(defaults: defaults, plaintextKey: legacyPlaintextTokenKey, account: account)
-        for accountName in assistantSecretAccounts {
-            migratePlaintextSecret(defaults: defaults, plaintextKey: secretFallbackKey(for: accountName), account: accountName)
-        }
         migratePlaintextSecret(
             defaults: defaults,
             plaintextKey: LGWebOSConfig.clientKeyDefaultsKey,

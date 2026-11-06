@@ -28,7 +28,7 @@ public struct SettingsWindowView: View {
         let opener = SettingsWindowOpener.shared
         ZStack(alignment: .bottom) {
             VStack(spacing: 0) {
-                SettingsCategoryPicker(selection: $tab, hasUpdateBadge: store.updateState.badgeRelease != nil)
+                SettingsCategoryPicker(selection: $tab)
                     .frame(maxWidth: DesignTokens.Settings.navigationWidth)
                     .padding(.horizontal, 24)
                     .padding(.top, 16)
@@ -86,16 +86,12 @@ public struct SettingsWindowView: View {
             tab = requested
             opener.requestedTab = nil
         }
-        .task {
-            await store.checkForUpdatesIfNeeded()
-        }
     }
     @ViewBuilder
     private var settingsPage: some View {
         switch tab {
         case .general: GeneralSettingsTab(store: store)
         case .connection: ConnectionSettingsTab(store: store)
-        case .assistant: AssistantSettingsTab(store: store)
         case .appearance: AppearanceSettingsTab(store: store)
         case .privacy: PrivacySettingsTab(store: store)
         case .about: AboutSettingsTab(store: store)
@@ -107,7 +103,6 @@ public struct SettingsWindowView: View {
 enum SettingsTab: String, CaseIterable, Identifiable, Hashable {
     case general
     case connection
-    case assistant
     case appearance
     case privacy
     case about
@@ -118,10 +113,9 @@ enum SettingsTab: String, CaseIterable, Identifiable, Hashable {
         switch self {
         case .general: return L10n.tr("通用", "General")
         case .connection: return L10n.tr("家居连接", "Connections")
-        case .assistant: return L10n.tr("AI 助手", "AI Assistant")
         case .appearance: return L10n.tr("外观", "Appearance")
         case .privacy: return L10n.tr("隐私与诊断", "Privacy & Diagnostics")
-        case .about: return L10n.tr("关于与更新", "About & Updates")
+        case .about: return L10n.tr("关于", "About")
         }
     }
 
@@ -129,7 +123,6 @@ enum SettingsTab: String, CaseIterable, Identifiable, Hashable {
         switch self {
         case .general: return L10n.tr("通用", "General")
         case .connection: return L10n.tr("连接", "Connect")
-        case .assistant: return L10n.tr("助手", "Assistant")
         case .appearance: return L10n.tr("外观", "Display")
         case .privacy: return L10n.tr("隐私", "Privacy")
         case .about: return L10n.tr("关于", "About")
@@ -140,7 +133,6 @@ enum SettingsTab: String, CaseIterable, Identifiable, Hashable {
         switch self {
         case .general: return "slider.horizontal.3"
         case .connection: return "link"
-        case .assistant: return "sparkles"
         case .appearance: return "circle.lefthalf.filled"
         case .privacy: return "lock"
         case .about: return "info.circle"
@@ -228,12 +220,8 @@ private struct GeneralSettingsTab: View {
 
     var body: some View {
         let _ = store.effectiveLanguage
-        let hasActiveUpdate = store.updateState.badgeRelease != nil || store.updateState.isFailure
         ScrollView(.vertical, showsIndicators: true) {
             VStack(alignment: .leading, spacing: 16) {
-                if hasActiveUpdate {
-                    UpdateSection(store: store)
-                }
 
                 SettingsSection(title: L10n.tr("菜单栏与交互体验", "Menu Bar & Interface")) {
                     SettingsValueRow(title: L10n.tr("界面语言", "Language")) {
@@ -302,8 +290,8 @@ private struct GeneralSettingsTab: View {
                     )
 
                     Text(L10n.tr(
-                        "默认关闭。开启后，开关、全关和 AI 执行成功会播放轻提示音，失败会播放另一种提示音。",
-                        "Off by default. When enabled, successful toggles, All Off and AI actions play a soft cue, and failures play a different one."
+                        "默认关闭。开启后，开关和全关成功会播放轻提示音，失败会播放另一种提示音。",
+                        "Off by default. When enabled, successful toggles and All Off actions play a soft cue, and failures play a different one."
                     ))
                     .font(.system(size: DesignTokens.TypeSize.caption))
                     .foregroundStyle(.secondary)
@@ -335,11 +323,13 @@ private struct GeneralSettingsTab: View {
                     .frame(minHeight: DesignTokens.Settings.rowHeight)
                 }
 
+                RetiredTimersSection(store: store)
+
                 SettingsSection(title: L10n.tr("全局快捷键", "Global Shortcut")) {
                     SettingsToggleRow(
                         title: L10n.tr(
-                            "启用全局快捷键 \(hotkey.shortcut.displayString)（短按面板，长按语音）",
-                            "Global shortcut \(hotkey.shortcut.displayString) (tap for dashboard, hold to speak)"
+                            "启用全局快捷键 \(hotkey.shortcut.displayString)（呼出或收起面板）",
+                            "Global shortcut \(hotkey.shortcut.displayString) (toggle dashboard)"
                         ),
                         isOn: Binding(
                             get: { store.enableGlobalHotkey },
@@ -446,7 +436,7 @@ private struct GeneralSettingsTab: View {
 
                 SettingsSection(title: L10n.tr("首次设置", "Setup")) {
                     HStack {
-                        Text(L10n.tr("重新打开新手引导，可再次查看连接、AI 与语音步骤。", "Reopen the setup guide to review connections, AI and voice."))
+                        Text(L10n.tr("重新打开新手引导，查看连接与键盘操作说明。", "Reopen the setup guide to review connections and keyboard controls."))
                             .font(.system(size: DesignTokens.TypeSize.caption))
                             .foregroundStyle(.secondary)
                         Spacer()
@@ -674,21 +664,7 @@ private struct ConnectionSettingsTab: View {
     }
 }
 
-// MARK: - AI Assistant
-
-private struct AssistantSettingsTab: View {
-    let store: HomeStore
-
-    var body: some View {
-        let _ = store.effectiveLanguage
-        ScrollView(.vertical, showsIndicators: true) {
-            VStack(alignment: .leading, spacing: 16) {
-                AssistantSettingsSection(store: store)
-            }
-            .padding(14)
-        }
-    }
-}
+// MARK: - Appearance
 
 // MARK: - Appearance
 
@@ -696,7 +672,6 @@ private struct AppearanceSettingsTab: View {
     let store: HomeStore
     @AppStorage(AppAppearance.storageKey) private var appearanceRaw: String = AppAppearance.system.rawValue
     @AppStorage(PanelPrefs.climatePanelKey) private var climatePanelModule: Bool = true
-    @AppStorage(PanelHeight.storageKey) private var panelHeightRaw: String = PanelHeight.standard.rawValue
 
     var body: some View {
         let _ = store.effectiveLanguage
@@ -720,18 +695,18 @@ private struct AppearanceSettingsTab: View {
                 }
 
                 SettingsSection(title: L10n.tr("面板布局", "Panel Layout")) {
-                    HStack {
-                        Text(L10n.tr("面板高度", "Panel Height"))
-                            .font(.system(size: DesignTokens.TypeSize.body))
-                        Spacer()
-                        GlassSegmentedControl(
-                            selection: $panelHeightRaw,
-                            segments: PanelHeight.allCases.map {
-                                GlassSegment(value: $0.rawValue, title: $0.title)
-                            }
-                        )
-                        .frame(width: 210)
+                    Text(L10n.tr(
+                        "拖动面板边缘或右下角可以自由调整大小，松开后自动记住尺寸。",
+                        "Drag the panel edges or its bottom-right grip to resize. The size is remembered when you release."
+                    ))
+                    .font(.system(size: DesignTokens.TypeSize.caption))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                    Button(L10n.tr("恢复默认尺寸", "Reset Panel Size")) {
+                        MenuBarPanelController.shared.resetPanelSize()
                     }
+                    .buttonStyle(PillActionButtonStyle())
 
                     Divider().overlay(Color.primary.opacity(0.06))
 
@@ -762,8 +737,8 @@ private struct PrivacySettingsTab: View {
             VStack(alignment: .leading, spacing: 16) {
                 SettingsSection(title: L10n.tr("诊断信息", "Diagnostics")) {
                     Text(L10n.tr(
-                        "复制一段 Markdown 粘贴到 GitHub issue。内容只有版本、系统、后端、型号与未识别设备，不含设备 ID、令牌、服务器地址或账号信息。",
-                        "Copies Markdown for a GitHub issue: versions, OS, backend, models and skipped devices only. No device IDs, tokens, server addresses or account information."
+                        "复制本机诊断摘要，便于排查问题。内容只有版本、系统、后端、型号与未识别设备，不含设备 ID、令牌、服务器地址或账号信息。",
+                        "Copy a local diagnostic summary for troubleshooting: versions, OS, backend, models and skipped devices only. No device IDs, tokens, server addresses or account information."
                     ))
                     .font(.system(size: DesignTokens.TypeSize.caption))
                     .foregroundStyle(.secondary)
@@ -788,12 +763,6 @@ private struct PrivacySettingsTab: View {
 
                         Spacer()
 
-                        Button(L10n.tr("打开 GitHub Issues", "Open GitHub Issues")) {
-                            if let url = URL(string: "https://github.com/jryang1997/MenuBarMijia/issues") {
-                                NSWorkspace.shared.open(url)
-                            }
-                        }
-                        .buttonStyle(PillActionButtonStyle())
                     }
                 }
 
@@ -853,21 +822,11 @@ private struct PrivacySettingsTab: View {
 
                             Spacer()
 
-                            if let url = feedbackURL(for: device) {
-                                Link(destination: url) {
-                                    HStack(spacing: 3) {
-                                        Image(systemName: "arrow.up.right.square")
-                                        Text(L10n.tr("去 GitHub 反馈", "Report on GitHub"))
-                                    }
-                                    .font(.system(size: DesignTokens.TypeSize.caption, weight: .medium))
-                                }
-                            }
                         }
                     }
                 }
 
                 SettingsSection(title: L10n.tr("隐私", "Privacy")) {
-                    privacyBullet(L10n.tr("语音只在本机识别时可完全离线；不支持的语种会提示改用苹果服务器。", "On-device speech stays on this Mac; unsupported languages say they fall back to Apple's servers."))
                     privacyBullet(L10n.tr("诊断报告不含设备 ID、令牌、服务器地址或账号信息。", "Diagnostics never include device IDs, tokens, server addresses or account info."))
                     privacyBullet(L10n.tr("演示模式完全离线，不发起任何网络请求。", "Demo mode is fully offline and sends no requests."))
                     privacyBullet(L10n.tr("最近错误只记录次数与时间，不保存错误原文。", "Recent errors are counted by time only; the raw text is not stored."))
@@ -909,7 +868,6 @@ private struct PrivacySettingsTab: View {
             lastErrorAt: errorLog.errorTimestamps.last,
             extraSettings: [
                 L10n.tr("快捷键", "Shortcut") + ": " + HotkeyPreferences.load().displayString,
-                L10n.tr("本机语音", "On-device speech") + ": " + (store.prefersOnDeviceSpeech ? "on" : "off"),
             ]
         )
         let pasteboard = NSPasteboard.general
@@ -922,17 +880,6 @@ private struct PrivacySettingsTab: View {
         }
     }
 
-    private func feedbackURL(for device: UnsupportedDevice) -> URL? {
-        var components = URLComponents(string: "https://github.com/jryang1997/MenuBarMijia/issues/new")
-        components?.queryItems = [
-            URLQueryItem(name: "template", value: "unsupported_device.yml"),
-            URLQueryItem(name: "title", value: L10n.tr(
-                "[设备不支持] \(device.name) (\(device.model))",
-                "[Unsupported device] \(device.name) (\(device.model))"
-            )),
-        ]
-        return components?.url
-    }
 }
 
 // MARK: - About
@@ -968,7 +915,7 @@ private struct AboutSettingsTab: View {
                             )
 
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("MenuBarMijia")
+                            Text(L10n.tr("MenuBarMijia · 本机自用版", "MenuBarMijia · Personal Build"))
                                 .font(.system(size: DesignTokens.TypeSize.body, weight: .bold))
                             Text(L10n.tr("版本 \(appVersion) (\(buildNumber))", "Version \(appVersion) (\(buildNumber))"))
                                 .font(.system(size: DesignTokens.TypeSize.caption))
@@ -985,16 +932,17 @@ private struct AboutSettingsTab: View {
                         }
                     }
 
-                    HStack(spacing: 8) {
-                        Link(L10n.tr("项目主页", "Repository"), destination: URL(string: "https://github.com/jryang1997/MenuBarMijia")!)
-                        Link(L10n.tr("问题反馈", "Issues"), destination: URL(string: "https://github.com/jryang1997/MenuBarMijia/issues")!)
-                        Link(L10n.tr("更新日志", "Releases"), destination: URL(string: "https://github.com/jryang1997/MenuBarMijia/releases")!)
-                        Spacer()
-                    }
-                    .font(.system(size: DesignTokens.TypeSize.caption, weight: .medium))
-                }
+                    Link(L10n.tr("项目主页", "Repository"), destination: URL(string: "https://github.com/Phowx/MenuBarMijia")!)
+                        .font(.system(size: DesignTokens.TypeSize.caption, weight: .medium))
 
-                UpdateSection(store: store)
+                    Text(L10n.tr(
+                        "本机自用构建，更新时重新编译并替换应用。基于 MIT 开源项目 MenuBarMijia，保留原作者署名与许可证。",
+                        "A personal local build. Rebuild and replace the app to update it. Based on the MIT-licensed MenuBarMijia project, with original attribution and license retained."
+                    ))
+                    .font(.system(size: DesignTokens.TypeSize.caption))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
 
                 SettingsSection(title: L10n.tr("退出", "Quit")) {
                     HStack {
@@ -1152,5 +1100,39 @@ struct LGWebOSSettingsSection: View {
         next.host = hostDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         next.macAddress = macDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         store.updateLGWebOSConfig(next)
+    }
+}
+
+struct RetiredTimersSection: View {
+    let store: HomeStore
+    @State private var confirmsRemoval = false
+
+    var body: some View {
+        if store.retiredTimerData != nil {
+            SettingsSection(title: L10n.tr("旧版定时任务已停用", "Retired Timers")) {
+                Text(L10n.tr(
+                    "文字指令功能已移除。以下旧任务不会自动执行，记录将保留到你手动清理。",
+                    "Language commands have been removed. Old timers will never run automatically; their records stay until you clear them."
+                ))
+                    .foregroundStyle(.secondary)
+                ForEach(store.retiredTimers) { timer in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(timer.reply)
+                        Text(timer.fireDate, style: .date) + Text(" ") + Text(timer.fireDate, style: .time)
+                    }
+                }
+                if store.retiredTimers.isEmpty {
+                    Text(L10n.tr("保留了无法解析的旧任务记录。", "An unreadable timer archive has been preserved."))
+                }
+                Button(L10n.tr("清理旧任务记录", "Clear Old Timer Records"), role: .destructive) {
+                    confirmsRemoval = true
+                }
+                .buttonStyle(PillActionButtonStyle())
+                .confirmationDialog(L10n.tr("删除旧版定时任务记录？", "Delete the old timer records?"), isPresented: $confirmsRemoval) {
+                    Button(L10n.tr("删除记录", "Delete Records"), role: .destructive) { store.clearRetiredTimers() }
+                    Button(L10n.tr("取消", "Cancel"), role: .cancel) {}
+                }
+            }
+        }
     }
 }

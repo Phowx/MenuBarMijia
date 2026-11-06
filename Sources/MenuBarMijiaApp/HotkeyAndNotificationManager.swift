@@ -8,28 +8,19 @@ import MijiaCore
 public final class HotkeyAndNotificationManager: NSObject, @preconcurrency UNUserNotificationCenterDelegate {
     public static let shared = HotkeyAndNotificationManager()
 
-    /// Holding the global shortcut (`⌥M` by default) for 0.5 s starts hold-to-talk voice input,
-    /// matching the menu-bar icon long-press threshold (`MenuBarPanelController.holdThreshold`).
-    public static let hotkeyHoldThreshold: TimeInterval = 0.5
-
     private weak var store: HomeStore?
     private var hotKeyRef: EventHotKeyRef?
     private var eventHandlerRef: EventHandlerRef?
-    private var hotkeyHoldTask: Task<Void, Never>?
     public private(set) var isHotkeyPhysicallyDown = false
-    public private(set) var isHotkeyHoldTriggered = false
     private var localKeyMonitor: Any?
     private var localKeyUpMonitor: Any?
     private var localFlagsMonitor: Any?
-    private var windowBecomeKeyObserver: NSObjectProtocol?
     private var applicationBecomeActiveObserver: NSObjectProtocol?
     private var safetyTimerTask: Task<Void, Never>?
     private var pendingAlertsById: [String: SafetyAlert] = [:]
 
     private static let turnOffActionId = "TURN_OFF_ACTION"
     private static let safetyCategoryId = "MIJIA_SAFETY_ALERT"
-    private static let runMissedTimerActionId = "RUN_MISSED_TIMER_ACTION"
-    private static let missedTimerCategoryId = "MIJIA_MISSED_TIMER"
 
     private override init() {
         super.init()
@@ -43,15 +34,12 @@ public final class HotkeyAndNotificationManager: NSObject, @preconcurrency UNUse
     }
 
     func attachStoreForTesting(_ store: HomeStore?) {
-        cancelHotkeyHold()
+        cancelHotkeyPress()
         self.store = store
     }
 
     public func start(with store: HomeStore) {
         self.store = store
-        store.onTerminateForUpdate = {
-            NSApplication.shared.terminate(nil)
-        }
         store.onGlobalHotkeyPreferenceChanged = { [weak self] enabled in
             self?.syncGlobalHotKeyRegistration(enabled: enabled)
         }
@@ -99,7 +87,7 @@ public final class HotkeyAndNotificationManager: NSObject, @preconcurrency UNUse
     }
 
     private func unregisterGlobalHotKey() {
-        cancelHotkeyHold()
+        cancelHotkeyPress()
         if let ref = hotKeyRef {
             UnregisterEventHotKey(ref)
             hotKeyRef = nil
@@ -187,47 +175,20 @@ public final class HotkeyAndNotificationManager: NSObject, @preconcurrency UNUse
         return mask
     }
 
-    /// Short press (< `hotkeyHoldThreshold`) toggles the panel on release; holding for at least
-    /// `hotkeyHoldThreshold` opens the panel and starts Push-to-Talk voice recognition, matching
-    /// the menu-bar icon press/hold gesture.
-    func handleGlobalHotKeyPressed(holdThreshold: TimeInterval = HotkeyAndNotificationManager.hotkeyHoldThreshold) {
-        guard let store, store.enableGlobalHotkey else { return }
-        guard !isHotkeyPhysicallyDown else { return }
+    func handleGlobalHotKeyPressed() {
+        guard let store, store.enableGlobalHotkey, !isHotkeyPhysicallyDown else { return }
         isHotkeyPhysicallyDown = true
-        isHotkeyHoldTriggered = false
-        hotkeyHoldTask?.cancel()
-        hotkeyHoldTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(holdThreshold))
-            guard !Task.isCancelled, let self, self.isHotkeyPhysicallyDown, !self.isHotkeyHoldTriggered else { return }
-            self.isHotkeyHoldTriggered = true
-            MenuBarPanelController.shared.beginHoldToTalk()
-        }
     }
 
     func handleGlobalHotKeyReleased() {
         guard isHotkeyPhysicallyDown else { return }
         isHotkeyPhysicallyDown = false
-        hotkeyHoldTask?.cancel()
-        hotkeyHoldTask = nil
-
-        if isHotkeyHoldTriggered {
-            isHotkeyHoldTriggered = false
-            MenuBarPanelController.shared.endHoldToTalk()
-        } else {
-            guard let store, store.enableGlobalHotkey else { return }
-            toggleMenuBarExtraWindow()
-        }
+        guard let store, store.enableGlobalHotkey else { return }
+        toggleMenuBarExtraWindow()
     }
 
-    private func cancelHotkeyHold() {
-        hotkeyHoldTask?.cancel()
-        hotkeyHoldTask = nil
-        let wasHoldTriggered = isHotkeyHoldTriggered
+    private func cancelHotkeyPress() {
         isHotkeyPhysicallyDown = false
-        isHotkeyHoldTriggered = false
-        if wasHoldTriggered {
-            MenuBarPanelController.shared.endHoldToTalk()
-        }
     }
 
     /// Opens the control center, or closes it when it is already on screen.
@@ -287,22 +248,7 @@ public final class HotkeyAndNotificationManager: NSObject, @preconcurrency UNUse
             }
         }
 
-        // Opening any window of our own (Settings, the panel) is a chance to run the daily update
-        // check. Menu-bar gestures are handled by the status item controller.
-        if windowBecomeKeyObserver == nil {
-            windowBecomeKeyObserver = NotificationCenter.default.addObserver(
-                forName: NSWindow.didBecomeKeyNotification,
-                object: nil,
-                queue: .main
-            ) { [weak self] _ in
-                MainActor.assumeIsolated {
-                    guard let self else { return }
-                    Task { @MainActor [weak self] in
-                        await self?.store?.checkForUpdatesIfNeeded()
-                    }
-                }
-            }
-        }
+
     }
 
     // MARK: - 3. Local Keyboard Shortcuts
@@ -317,11 +263,6 @@ public final class HotkeyAndNotificationManager: NSObject, @preconcurrency UNUse
         }
 
         // Esc collapses the side attachment first; the dashboard retains its other shortcuts.
-        if code == kVK_Escape, store.isGrokBallStageExpanded,
-           MenuBarPanelController.shared.isPanelWindow(NSApp.keyWindow) {
-            store.dismissGrokBallStage()
-            return true
-        }
 
         // #60: an open search owns ↑↓ / Return / → / Esc / typing. With no search it returns false for
         // every key, so the shortcuts below — and the text-field guard right after this — are unchanged.
@@ -329,7 +270,7 @@ public final class HotkeyAndNotificationManager: NSObject, @preconcurrency UNUse
             return true
         }
 
-        // Do not let key-repeats of the global shortcut (e.g. holding ⌥M for voice input) leak into
+        // Do not let key-repeats of the global shortcut leak into
         // a focused text field (`µ` on US keyboards) or re-toggle the panel mid-hold.
         if store.enableGlobalHotkey,
            !HotkeyRecorderController.shared.isRecording,
@@ -340,14 +281,11 @@ public final class HotkeyAndNotificationManager: NSObject, @preconcurrency UNUse
             return true
         }
 
-        // Do not intercept typing when a text field (e.g., XiaoAi input or Settings URL) is first responder
+        // Do not intercept typing when a text field (e.g., a device name or Settings URL) is first responder
         if let responder = NSApp.keyWindow?.firstResponder,
            responder is NSTextView || responder is NSTextField {
             if code == kVK_Escape {
-                if store.isShowingAssistantBar {
-                    SpeechInputController.shared.stop(andSubmit: false, store: store)
-                    store.dismissAssistantBar()
-                }
+
                 NSApp.keyWindow?.makeFirstResponder(nil)
                 return true
             }
@@ -358,18 +296,6 @@ public final class HotkeyAndNotificationManager: NSObject, @preconcurrency UNUse
         // normal AppKit control behavior instead of triggering device actions (#42).
         if !MenuBarPanelController.shared.isPanelWindow(NSApp.keyWindow) {
             return false
-        }
-
-        if event.charactersIgnoringModifiers == "/",
-           event.modifierFlags.intersection([.command, .option, .control]).isEmpty {
-            store.presentAssistantBar()
-            return true
-        }
-
-        if event.charactersIgnoringModifiers?.lowercased() == "v",
-           event.modifierFlags.intersection([.command, .option, .control]).isEmpty {
-            store.presentAssistantBar(startVoice: true)
-            return true
         }
 
         switch code {
@@ -393,10 +319,7 @@ public final class HotkeyAndNotificationManager: NSObject, @preconcurrency UNUse
             store.cycleRoom(delta: delta)
             return true
         case kVK_Escape:
-            if store.isShowingAssistantBar {
-                SpeechInputController.shared.stop(andSubmit: false, store: store)
-                store.dismissAssistantBar()
-            } else if store.expandedDeviceId != nil {
+            if store.expandedDeviceId != nil {
                 store.expandedDeviceId = nil
             } else if store.focusedDeviceId != nil {
                 store.focusedDeviceId = nil
@@ -437,28 +360,14 @@ public final class HotkeyAndNotificationManager: NSObject, @preconcurrency UNUse
             intentIdentifiers: [],
             options: []
         )
-        let runMissedAction = UNNotificationAction(
-            identifier: Self.runMissedTimerActionId,
-            title: L10n.tr("立即补执行", "Run Now"),
-            options: []
-        )
-        let missedCategory = UNNotificationCategory(
-            identifier: Self.missedTimerCategoryId,
-            actions: [runMissedAction],
-            intentIdentifiers: [],
-            options: []
-        )
-        center.setNotificationCategories([category, missedCategory])
+        center.setNotificationCategories([category])
 
         // Permission is requested on demand (#55): first time 守护提醒 is enabled or a timer is set,
         // after an in-app explanation. Nothing is asked at launch.
         store?.onSafetyAlert = { [weak self] alert in
             self?.deliverNotification(for: alert)
         }
-        store?.onMissedScheduledCommand = { [weak self] entry in
-            self?.deliverMissedTimerNotification(for: entry)
-        }
-        store?.notifyMissedScheduledCommandsIfNeeded()
+
         Task { [weak self] in
             await self?.refreshNotificationPermission()
         }
@@ -505,25 +414,6 @@ public final class HotkeyAndNotificationManager: NSObject, @preconcurrency UNUse
         NSWorkspace.shared.open(url)
     }
 
-    private struct MissedTimerNotificationIdentifier {
-        private static let prefix = "missed-timer:"
-        let commandId: UUID
-
-        var rawValue: String { "\(Self.prefix)\(commandId.uuidString)" }
-
-        init(commandId: UUID) {
-            self.commandId = commandId
-        }
-
-        init?(rawValue: String) {
-            guard rawValue.hasPrefix(Self.prefix),
-                  let id = UUID(uuidString: String(rawValue.dropFirst(Self.prefix.count))) else {
-                return nil
-            }
-            self.commandId = id
-        }
-    }
-
     private func startSafetyTimer() {
         safetyTimerTask?.cancel()
         safetyTimerTask = Task { [weak self] in
@@ -535,7 +425,6 @@ public final class HotkeyAndNotificationManager: NSObject, @preconcurrency UNUse
                         self.deliverNotification(for: alert)
                     }
                 }
-                await store.checkForUpdatesIfNeeded()
             }
         }
     }
@@ -579,26 +468,6 @@ public final class HotkeyAndNotificationManager: NSObject, @preconcurrency UNUse
         UNUserNotificationCenter.current().add(request)
     }
 
-    private func deliverMissedTimerNotification(for entry: ScheduledCommand) {
-        guard Bundle.main.bundleURL.pathExtension == "app" else { return }
-
-        let content = UNMutableNotificationContent()
-        content.title = L10n.tr("已错过定时任务", "Missed Scheduled Command")
-        content.body = L10n.tr(
-            "应用关闭或电脑睡眠时错过的定时：「\(entry.reply)」。没有自动执行，可点通知按钮立即补执行。",
-            "Missed while the app was closed or the Mac was asleep: \"\(entry.reply)\". It did not run. Click Run Now to run it."
-        )
-        content.sound = .default
-        content.categoryIdentifier = Self.missedTimerCategoryId
-
-        let request = UNNotificationRequest(
-            identifier: MissedTimerNotificationIdentifier(commandId: entry.id).rawValue,
-            content: content,
-            trigger: nil
-        )
-        UNUserNotificationCenter.current().add(request)
-    }
-
     public func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         didReceive response: UNNotificationResponse,
@@ -608,11 +477,7 @@ public final class HotkeyAndNotificationManager: NSObject, @preconcurrency UNUse
         if response.actionIdentifier == Self.turnOffActionId,
            let alert = pendingAlertsById[alertId] {
             store?.executeSafetyAlertAction(alert)
-        } else if response.actionIdentifier == Self.runMissedTimerActionId,
-                  let missedId = MissedTimerNotificationIdentifier(rawValue: alertId) {
-            Task { @MainActor [weak self] in
-                _ = await self?.store?.runMissedScheduledCommand(id: missedId.commandId)
-            }
+
         }
         completionHandler()
     }

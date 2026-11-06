@@ -2,32 +2,15 @@ import AppKit
 import SwiftUI
 import MijiaCore
 
-/// App-owned menu-bar item and panel (#56).
-///
-/// `MenuBarExtra` keeps its status item and window inside private AppKit objects, so reaching them
-/// required KVC on `_statusItem`, the private `setLongPressAction:` / `_requestExpandedInterfaceSession`
-/// selectors, ivar scanning and window class-name sniffing. Owning the `NSStatusItem` and a borderless
-/// `NSPanel` puts every capability the extra provided on public API:
-///
-/// - icon + text from `HomeStore.menuBarSymbolName` / `menuBarText`, with the listening waveform and
-///   the live transcript while `SpeechInputController` records;
-/// - tooltip and accessibility label from `MenuBarStatusSummary`;
-/// - a left click toggles the panel; holding either button for 0.5 s starts hold-to-talk;
-/// - the panel closes on an outside click or when the app deactivates (unless dictation is running);
-/// - it becomes key, so arrow keys, Esc, ⌘, and its text fields behave as they did before;
-/// - it is anchored under the item's own screen and stays on screen across display changes;
-/// - width is the 376 pt the panel draws at, height follows `PanelHeight`.
-///
-/// The panel's SwiftUI tree stays alive between opens, like a `.window`-style `MenuBarExtra`, so
-/// scroll position, search text and layout state survive a close; `didShow` / `didHide` notifications
-/// let the panel replay its drop-in animation. `store.setPanelVisible` is driven from here, so the
-/// polling rhythm does not depend on SwiftUI lifecycle callbacks firing per open.
+/// App-owned status item and control panel. A left click toggles the panel; clicking
+/// outside or deactivating the app dismisses it. The SwiftUI tree survives between opens.
 @MainActor
-final class MenuBarPanelController: NSObject {
+final class MenuBarPanelController: NSObject, NSWindowDelegate {
     static let shared = MenuBarPanelController()
 
-    /// Control center width, identical in every skin.
-    static let panelWidth: CGFloat = 376
+    static let panelWidth: CGFloat = PanelSizePreferences.defaultSize.width
+    var preferences: UserDefaults = .standard
+    var onQuit: @MainActor () -> Void = { NSApplication.shared.terminate(nil) }
     /// The panel draws its own material; AppKit only clips it to the extra's rounded corners.
     static let panelCornerRadius: CGFloat = 12
 
@@ -37,15 +20,8 @@ final class MenuBarPanelController: NSObject {
 
     private static let topGap: CGFloat = 6
     private static let screenMargin: CGFloat = 8
-    /// Press-and-hold on the icon starts dictation instead of toggling the panel. 0.5 s is long
-    /// enough that an ordinary slow click toggles the panel instead of dictating.
-    private static let holdThreshold: TimeInterval = 0.5
-    private static let holdTick: TimeInterval = 0.03
-
     private(set) var statusItem: NSStatusItem?
     private(set) var panelWindow: NSPanel?
-    private var grokBallSidecar: GrokBallSidecarController?
-    var grokBallSidecarWindow: NSPanel? { grokBallSidecar?.panelWindow }
 
     /// Tests switch this off so `swift test` shows the window without stealing key status or focus
     /// from the terminal; the app keeps it on, which is what makes the panel key like the extra was.
@@ -53,12 +29,6 @@ final class MenuBarPanelController: NSObject {
 
     private weak var store: HomeStore?
     private var labelTimer: Timer?
-    private var pressTimer: Timer?
-    private var pressStartedAt: TimeInterval = 0
-    private var pressTriggered = false
-    /// Only a left click toggles; a right click exists solely to start dictation.
-    private var pressAllowsToggle = true
-    private var suppressReleaseUntil: TimeInterval = 0
     /// What the status button currently shows; kept after a sync so diagnostics and tests can read it.
     private(set) var labelSymbol: String?
     private(set) var labelText: String?
@@ -117,14 +87,11 @@ final class MenuBarPanelController: NSObject {
         removeMouseMonitors()
         labelTimer?.invalidate()
         labelTimer = nil
-        stopPressTimer()
         for observer in observers {
             NotificationCenter.default.removeObserver(observer)
         }
         observers.removeAll()
-        grokBallSidecar?.tearDown()
-        grokBallSidecar = nil
-        store?.dismissGrokBallStage()
+        panelWindow?.delegate = nil
         panelWindow?.orderOut(nil)
         panelWindow?.contentView = nil
         panelWindow = nil
@@ -146,37 +113,18 @@ final class MenuBarPanelController: NSObject {
             button.imagePosition = .imageLeading
             button.target = self
             button.action = #selector(handleStatusItemPress)
-            // Send every press/release so a short click toggles and a hold tracks dictation instead
-            // of AppKit acting on mouse-down alone.
-            _ = button.sendAction(on: [.leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp])
+            // Toggle once on release; holding the icon has no secondary action.
+            _ = button.sendAction(on: [.leftMouseUp])
         }
-        configureStatusItemLongPress(on: item)
         statusItem = item
         syncStatusItem()
-    }
-
-    /// Registers `setLongPressAction:` on `NSStatusItem` for macOS 26+, where the out-of-process
-    /// menu bar (`NSMenuBarNavigationSceneExtension`) routes press-and-hold and secondary clicks
-    /// through `-[NSStatusItem _performSecondaryAction:type:]` instead of delivering `leftMouseDown`
-    /// to the button action when the finger first touches the trackpad.
-    private func configureStatusItemLongPress(on item: NSStatusItem) {
-        // Always assign `item.target` unconditionally: `-[NSStatusItem target]` falls back to
-        // `button.target`, whereas `-[NSStatusItem _performSecondaryAction:type:]` reads the
-        // `NSStatusItem->_target` ivar directly without consulting `button.target`.
-        item.target = self
-        let setLongSel = NSSelectorFromString("setLongPressAction:")
-        guard item.responds(to: setLongSel),
-              let method = class_getInstanceMethod(type(of: item), setLongSel) else { return }
-        typealias SetSelFn = @convention(c) (AnyObject, Selector, Selector) -> Void
-        let imp = unsafeBitCast(method_getImplementation(method), to: SetSelFn.self)
-        imp(item, setLongSel, #selector(handleStatusItemNativeLongPress(_:)))
     }
 
     // MARK: - Menu Bar Label (#54)
 
     private func startLabelUpdates() {
         guard labelTimer == nil else { return }
-        // A 0.5 s poll mirrors the old 2 s tooltip loop and adds the listening waveform; the label
+        // Keep the menu-bar sensor label current; the label
         // lives in AppKit, so `@Observable` tracking cannot drive it.
         let timer = Timer(
             timeInterval: 0.5,
@@ -196,9 +144,8 @@ final class MenuBarPanelController: NSObject {
     /// Pushes icon, text, tooltip and accessibility label onto the status button.
     func syncStatusItem() {
         guard let button = statusItem?.button, let store else { return }
-        let speech = SpeechInputController.shared
-        let symbol = speech.isListening ? "waveform" : store.menuBarSymbolName
-        let text = speech.isListening ? Self.speechLabel(speech.draft) : store.menuBarText
+        let symbol = store.menuBarSymbolName
+        let text = store.menuBarText
         let summary = MenuBarStatusSummary.text(for: store)
 
         if symbol != labelSymbol {
@@ -210,7 +157,7 @@ final class MenuBarPanelController: NSObject {
         }
         if text != labelText {
             labelText = text
-            button.attributedTitle = Self.statusTitle(text, isSpeech: speech.isListening)
+            button.attributedTitle = Self.statusTitle(text)
         }
         if summary != tooltipText {
             tooltipText = summary
@@ -220,24 +167,12 @@ final class MenuBarPanelController: NSObject {
         }
     }
 
-    /// Last ten characters of the live transcript, or "聆听中…" before the first words arrive.
-    static func speechLabel(_ draft: String) -> String {
-        let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return L10n.tr("聆听中…", "Listening…") }
-        if trimmed.count > 10 {
-            return String(trimmed.suffix(10))
-        }
-        return trimmed
-    }
-
-    /// Same typography as the SwiftUI label: 12 pt rounded, semibold for the live transcript and
-    /// medium with monospaced digits for the device readout.
-    private static func statusTitle(_ text: String?, isSpeech: Bool) -> NSAttributedString {
+    private static func statusTitle(_ text: String?) -> NSAttributedString {
         guard let text, !text.isEmpty else { return NSAttributedString(string: "") }
         let size: CGFloat = 12
-        let weight: NSFont.Weight = isSpeech ? .semibold : .medium
+        let weight: NSFont.Weight = .medium
         var font: NSFont
-        if !isSpeech, text.contains(where: { $0.isNumber }) {
+        if text.contains(where: { $0.isNumber }) {
             font = .monospacedDigitSystemFont(ofSize: size, weight: weight)
         } else {
             let base = NSFont.systemFont(ofSize: size, weight: weight)
@@ -276,23 +211,16 @@ final class MenuBarPanelController: NSObject {
 
     func showPanel() {
         guard let store else { return }
-        let panel = panelWindow ?? Self.makePanel()
+        let panel = panelWindow ?? Self.makePanel(size: Self.preferredContentSize(screen: statusScreen, defaults: preferences))
         panelWindow = panel
-        if grokBallSidecar == nil {
-            grokBallSidecar = GrokBallSidecarController(
-                store: store, parent: panel,
-                beginVoice: { [weak self] in self?.beginHoldToTalk() },
-                endVoice: { [weak self] in self?.endHoldToTalk() },
-                closePanel: { [weak self] in self?.hidePanel() }
-            )
-            installPanelGeometryObservers(for: panel)
-        }
+        panel.delegate = self
+        updateResizeLimits(for: panel)
         panel.appearance = Self.preferredAppearance()
         if panel.contentView == nil {
             attachContent(to: panel)
         }
 
-        let target = Self.frame(for: panel.frame.size, anchor: statusAnchor, screen: statusScreen)
+        let target = Self.frame(for: Self.preferredContentSize(screen: statusScreen, defaults: preferences), anchor: statusAnchor, screen: statusScreen)
         if panel.frame != target {
             panel.setFrame(target, display: true)
         }
@@ -309,7 +237,6 @@ final class MenuBarPanelController: NSObject {
         } else {
             panel.orderFront(nil)
         }
-        grokBallSidecar?.synchronize()
         // Re-showing an already visible panel (hotkey while open, URL scheme, intent) must not replay
         // the drop-in animation.
         guard !wasVisible else { return }
@@ -319,8 +246,6 @@ final class MenuBarPanelController: NSObject {
 
     func hidePanel() {
         guard let panel = panelWindow, panel.isVisible else { return }
-        grokBallSidecar?.hide()
-        store?.dismissGrokBallStage()
         panel.orderOut(nil)
         store?.setPanelVisible(false)
         // The SwiftUI tree stays alive, exactly like a `.window`-style `MenuBarExtra`: scroll
@@ -329,25 +254,53 @@ final class MenuBarPanelController: NSObject {
         NotificationCenter.default.post(name: Self.didHideNotification, object: panel)
     }
 
-    /// Sizing hook for `ControlCenterPanel`: 376 pt wide, `PanelHeight` tall, top edge kept under the
-    /// menu bar and clamped to the screen the item is on. No-op while the panel is closed.
     func updatePanelSize(width: CGFloat, height: CGFloat) {
         guard let panel = panelWindow else { return }
-        let target = Self.frame(
-            for: NSSize(width: Self.panelWidth, height: height),
-            anchor: statusAnchor,
-            screen: statusScreen
-        )
-        if panel.frame != target {
-            panel.setFrame(target, display: true)
-        }
-        grokBallSidecar?.synchronize()
+        let size = PanelSizePreferences.constrained(NSSize(width: width, height: height), available: availableSize)
+        panel.setFrame(Self.frame(for: size, anchor: statusAnchor, screen: statusScreen), display: true)
     }
 
-    private static func makePanel() -> NSPanel {
+    private var availableSize: NSSize {
+        let frame = (statusScreen ?? NSScreen.main)?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        return NSSize(width: frame.width - 16, height: frame.height - 24)
+    }
+
+    private func updateResizeLimits(for panel: NSPanel) {
+        panel.minSize = NSSize(width: min(PanelSizePreferences.minimumSize.width, availableSize.width),
+                               height: min(PanelSizePreferences.minimumSize.height, availableSize.height))
+        panel.maxSize = availableSize
+    }
+
+    func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
+        PanelSizePreferences.constrained(frameSize, available: availableSize)
+    }
+
+    func windowDidEndLiveResize(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow, window === panelWindow else { return }
+        rememberPanelSize()
+    }
+
+    func rememberPanelSize() {
+        guard let panel = panelWindow else { return }
+        PanelSizePreferences.save(panel.frame.size, to: preferences)
+    }
+
+    func resizePanel(from start: NSRect, delta: NSSize) {
+        guard let panel = panelWindow else { return }
+        let visible = (panel.screen ?? statusScreen ?? NSScreen.main)?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        panel.setFrame(PanelSizePreferences.draggedFrame(from: start, delta: delta, visibleFrame: visible), display: true)
+    }
+
+    func resetPanelSize() {
+        PanelSizePreferences.reset(in: preferences)
+        updatePanelSize(width: PanelSizePreferences.defaultSize.width, height: PanelSizePreferences.defaultSize.height)
+    }
+
+    private static func makePanel(size: NSSize) -> NSPanel {
         let panel = MenuBarPanel(
-            contentRect: NSRect(origin: .zero, size: preferredContentSize()),
-            styleMask: [.borderless],
+            contentRect: NSRect(origin: .zero, size: size),
+            styleMask: [.borderless, .resizable],
             backing: .buffered,
             defer: false
         )
@@ -377,9 +330,10 @@ final class MenuBarPanelController: NSObject {
 
     private func attachContent(to panel: NSPanel) {
         guard let store else { return }
-        let hosting = NSHostingView(rootView: ControlCenterPanel(store: store))
+        let hosting = NSHostingView(rootView: ControlCenterPanel(store: store, onQuit: onQuit))
         hosting.frame = NSRect(origin: .zero, size: panel.frame.size)
         hosting.autoresizingMask = [.width, .height]
+        hosting.sizingOptions = []
         hosting.wantsLayer = true
         hosting.layer?.cornerRadius = Self.panelCornerRadius
         hosting.layer?.masksToBounds = true
@@ -388,12 +342,9 @@ final class MenuBarPanelController: NSObject {
         _ = panel.makeFirstResponder(hosting)
     }
 
-    /// Width is fixed; height comes from the same `PanelHeight` preference the panel draws at.
-    static func preferredContentSize(screen: NSScreen? = nil) -> NSSize {
-        let raw = UserDefaults.standard.string(forKey: PanelHeight.storageKey)
-        let height = (raw.flatMap(PanelHeight.init(rawValue:)) ?? .standard).points
-        let available = (screen ?? NSScreen.main)?.visibleFrame.height ?? 900
-        return NSSize(width: panelWidth, height: min(height, available - 24))
+    static func preferredContentSize(screen: NSScreen? = nil, defaults: UserDefaults = .standard) -> NSSize {
+        let visible = (screen ?? NSScreen.main)?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        return PanelSizePreferences.load(from: defaults, available: NSSize(width: visible.width - 16, height: visible.height - 24))
     }
 
     // MARK: - Positioning
@@ -423,171 +374,12 @@ final class MenuBarPanelController: NSObject {
 
     // MARK: - Status Item Gesture
 
-    /// A short left click toggles the panel and holding either button for 0.5 s starts dictation.
-    /// On macOS 26+, the system menu bar (`NSMenuBarNavigationSceneExtension`) hosts status items
-    /// out-of-process: it delivers holds via `setLongPressAction:` (`_performSecondaryAction:type:`)
-    /// and delivers short clicks as a synthesized mouseDown+mouseUp pair upon release. Combining
-    /// button actions, `setLongPressAction:`, and mouse-down monitors covers both in-process and
-    /// out-of-process menu bar hosts.
+    /// A left click toggles once on release, with no secondary hold action.
     @objc func handleStatusItemPress() {
-        switch NSApp.currentEvent?.type {
-        case .leftMouseDown?:
-            guard ProcessInfo.processInfo.systemUptime >= suppressReleaseUntil, !pressTriggered else { return }
-            pressAllowsToggle = true
-            beginPress()
-        case .rightMouseDown?:
-            guard ProcessInfo.processInfo.systemUptime >= suppressReleaseUntil, !pressTriggered else { return }
-            pressAllowsToggle = false
-            beginPress()
-        case .leftMouseUp?, .rightMouseUp?:
-            // On macOS 26+ (NSSceneStatusItem), `-[NSStatusItem _performOneShotAction:]` synthesizes
-            // both `leftMouseDown` and `leftMouseUp` back-to-back at the moment the press begins while
-            // the physical mouse button is still held down. Only finish immediately when the button is
-            // no longer physically pressed; otherwise let `pressTimer` track the hold threshold and
-            // eventual release.
-            if (NSEvent.pressedMouseButtons & 0x3) == 0 {
-                finishPress()
-            }
-        default:
-            if !pressTriggered, ProcessInfo.processInfo.systemUptime >= suppressReleaseUntil {
-                togglePanel()
-            }
-        }
-    }
-
-    @objc func handleStatusItemNativeLongPress(_ sender: Any?) {
-        let now = ProcessInfo.processInfo.systemUptime
-        if !pressTriggered {
-            pressTriggered = true
-            pressAllowsToggle = false
-            pressStartedAt = now
-            beginHoldToTalk()
-        }
-        if (NSEvent.pressedMouseButtons & 0x3) != 0 {
-            startPressTimerIfNeeded()
-        } else {
-            finishPress()
-        }
-    }
-
-    private func beginHoldDetectionFromMonitor() {
-        let now = ProcessInfo.processInfo.systemUptime
-        guard now >= suppressReleaseUntil, !pressTriggered else { return }
-        if pressTimer == nil {
-            pressAllowsToggle = false
-            pressStartedAt = now
-            startPressTimerIfNeeded()
-        }
-    }
-
-    private func beginPress() {
-        let now = ProcessInfo.processInfo.systemUptime
-        guard now >= suppressReleaseUntil, !pressTriggered else { return }
-        if pressTimer == nil {
-            pressStartedAt = now
-        }
-        startPressTimerIfNeeded()
-    }
-
-    private func startPressTimerIfNeeded() {
-        guard pressTimer == nil else { return }
-        let timer = Timer(
-            timeInterval: Self.holdTick,
-            target: self,
-            selector: #selector(handlePressTick(_:)),
-            userInfo: nil,
-            repeats: true
-        )
-        pressTimer = timer
-        RunLoop.main.add(timer, forMode: .common)
-    }
-
-    @objc private func handlePressTick(_ timer: Timer) {
-        if (NSEvent.pressedMouseButtons & 0x3) != 0 {
-            guard !pressTriggered,
-                  ProcessInfo.processInfo.systemUptime - pressStartedAt >= Self.holdThreshold else { return }
-            // Keep ticking so the release still stops dictation.
-            pressTriggered = true
-            beginHoldToTalk()
-            return
-        }
-        // Released outside the button: the up action never arrives, so finish from here.
-        finishPress()
-    }
-
-    private func finishPress() {
-        guard pressTimer != nil || pressTriggered else { return }
-        let now = ProcessInfo.processInfo.systemUptime
-        stopPressTimer()
-
-        if pressTriggered {
-            pressTriggered = false
-            pressAllowsToggle = false
-            suppressReleaseUntil = now + 0.45
-            endHoldToTalk()
-            return
-        }
-
-        // AppKit can deliver both the up action and the timer fallback for one release.
-        guard now >= suppressReleaseUntil else { return }
-        if pressAllowsToggle {
-            pressAllowsToggle = false
-            suppressReleaseUntil = now + 0.15
-            togglePanel()
-        }
-    }
-
-    private func stopPressTimer() {
-        pressTimer?.invalidate()
-        pressTimer = nil
-    }
-
-    // MARK: - Hold to Talk
-
-    func beginHoldToTalk() {
-        guard let store else { return }
-        SpeechInputController.shared.startHoldToTalk(store: store)
-        syncStatusItem()
-        showPanel()
-        store.presentAssistantBar(startVoice: false)
-        // A microphone prompt or the first audio buffer can steal key status; re-assert the panel.
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(70))
-            guard let self, self.isPanelVisible, let store = self.store, store.isShowingAssistantBar else { return }
-            self.syncStatusItem()
-            self.showPanel()
-        }
-    }
-
-    func endHoldToTalk() {
-        guard let store else { return }
-        SpeechInputController.shared.finishHoldToTalk(store: store)
-        syncStatusItem()
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(70))
-            guard let self, self.isPanelVisible, let store = self.store, store.isShowingAssistantBar else { return }
-            self.syncStatusItem()
-            self.showPanel()
-        }
+        togglePanel()
     }
 
     // MARK: - Outside Click, Screens & Preferences
-
-    private func installPanelGeometryObservers(for panel: NSPanel) {
-        for name in [NSWindow.didMoveNotification, NSWindow.didResizeNotification,
-                     NSWindow.didChangeScreenNotification] {
-            observers.append(NotificationCenter.default.addObserver(
-                forName: name, object: panel, queue: .main
-            ) { [weak self] _ in
-                MainActor.assumeIsolated { self?.grokBallSidecar?.synchronize() }
-            })
-        }
-        observers.append(NotificationCenter.default.addObserver(
-            forName: NSWindow.willCloseNotification, object: panel, queue: .main
-        ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.hidePanel() }
-        })
-    }
 
     private func installObservers() {
         // Outside clicks end the session through two public signals: activating another app
@@ -672,65 +464,34 @@ final class MenuBarPanelController: NSObject {
     /// A click need not activate another app (desktop, nonactivating panels, other status items).
     /// Keep our own controls and status button working, and never swallow the original click.
     func handleMouseDown(in window: NSWindow?, at screenPoint: NSPoint) {
-        if let button = statusItem?.button,
-           let statusWindow = button.window {
-            let statusRect = statusWindow.convertToScreen(button.convert(button.bounds, to: nil))
-            if window === statusWindow || statusRect.insetBy(dx: -6, dy: -6).contains(screenPoint) {
-                if (NSEvent.pressedMouseButtons & 0x3) != 0 {
-                    beginHoldDetectionFromMonitor()
-                }
-                return
-            }
+        if let button = statusItem?.button, let statusWindow = button.window {
+            let rect = statusWindow.convertToScreen(button.convert(button.bounds, to: nil))
+            if window === statusWindow || rect.insetBy(dx: -6, dy: -6).contains(screenPoint) { return }
         }
-        guard isPanelVisible, let panel = panelWindow else { return }
-        if let sidecar = grokBallSidecar, window === sidecar.panelWindow {
-            if sidecar.containsScreenPoint(screenPoint) { return }
-        } else {
-            guard !isPanelWindow(window) else { return }
-        }
-        if let cameraWindow = CameraLivePanelController.shared.panelWindow,
-           cameraWindow.isVisible,
-           window === cameraWindow || cameraWindow.frame.contains(screenPoint) {
-            return
-        }
+        guard isPanelVisible, let panel = panelWindow, !isPanelWindow(window) else { return }
+        if let camera = CameraLivePanelController.shared.panelWindow,
+           camera.isVisible, window === camera || camera.frame.contains(screenPoint) { return }
         if panel.frame.contains(screenPoint) { return }
-        if let sidecar = grokBallSidecar, sidecar.containsScreenPoint(screenPoint) { return }
         if let children = panel.childWindows,
-           children.contains(where: { $0 !== grokBallSidecar?.panelWindow && $0.isVisible && $0.frame.contains(screenPoint) }) { return }
-        if SpeechInputController.shared.isListening
-            || SpeechInputController.shared.isHoldToTalk
-            || pressTriggered
-            || pressTimer != nil
-            || HotkeyAndNotificationManager.shared.isHotkeyPhysicallyDown { return }
+           children.contains(where: { $0.isVisible && $0.frame.contains(screenPoint) }) { return }
         hidePanel()
     }
 
     func handleApplicationResignActive() {
-        guard isPanelVisible else { return }
-        // A TCC prompt (microphone/speech) deactivates the app mid-dictation; keep the panel.
-        if SpeechInputController.shared.isListening
-            || SpeechInputController.shared.isHoldToTalk
-            || pressTriggered
-            || pressTimer != nil
-            || HotkeyAndNotificationManager.shared.isHotkeyPhysicallyDown { return }
-        hidePanel()
+        if isPanelVisible { hidePanel() }
     }
 
     func handleScreenParametersChanged() {
         guard let panel = panelWindow, panel.isVisible else { return }
+        updateResizeLimits(for: panel)
         panel.setFrame(
-            Self.frame(for: panel.frame.size, anchor: statusAnchor, screen: statusScreen),
+            Self.frame(for: Self.preferredContentSize(screen: statusScreen, defaults: preferences), anchor: statusAnchor, screen: statusScreen),
             display: true
         )
-        grokBallSidecar?.synchronize()
     }
 
     func handlePreferencesChanged() {
         panelWindow?.appearance = Self.preferredAppearance()
-        grokBallSidecarWindow?.appearance = Self.preferredAppearance()
-        guard isPanelVisible else { return }
-        let height = Self.preferredContentSize(screen: statusScreen).height
-        updatePanelSize(width: Self.panelWidth, height: height)
     }
 }
 

@@ -130,25 +130,16 @@ final class AutomationEngine {
         // Quick actions aggregate devices in the store and already show their own toast plus undo
         // banner; the longer automation window keeps the banner usable after unlocking (#59).
         case .quickAction(let action):
-            // Automation is not a user action, so it never trains habits (#34/#113).
-            store.executeQuickAction(action, undoBannerDuration: AutomationPolicy.undoWindow, recordsHabits: false)
+            store.executeQuickAction(action, undoBannerDuration: AutomationPolicy.undoWindow)
         case .devices, .scene:
             let intents = rule.action.intents()
             guard !intents.isEmpty else { return }
             let summary = rule.action.summary(devices: store.devices, scenes: store.scenes)
-            let stateBefore = store.assistantState
             _ = await store.runAutomation(
                 intents: intents,
                 title: L10n.format("自动化：%@", "Automation: %@", summary)
             )
-            // `runAutomation` reports failures through the assistant state; surface only a *new*
-            // failure as a toast, because the assistant bar (and its error text) may be closed when
-            // a rule fires.
-            if case .failed(let message) = store.assistantState, store.assistantState != stateBefore {
-                store.showToast(message, isError: true)
-            } else {
-                store.showToast(L10n.format("自动化：%@", "Automation: %@", summary))
-            }
+
         }
     }
 }

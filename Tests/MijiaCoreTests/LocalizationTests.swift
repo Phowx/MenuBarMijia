@@ -110,7 +110,6 @@ struct LocalizationTests {
             #expect(L10n.availableLanguages.contains(.zhHant))
             #expect(L10n.availableLanguages.prefix(2) == [.zhHans, .en])
             #expect(L10n.nativeName(for: .zhHant) == "繁體中文")
-            #expect(L10n.speechLocaleIdentifier(for: .zhHant) == "zh-TW")
             L10n.$overrideLanguage.withValue(.zhHans) {
                 #expect(L10n.tr("已关闭", "Off") == "已关闭")
             }
@@ -128,7 +127,6 @@ struct LocalizationTests {
             #expect(AppLanguagePreference(rawValue: "fr")?.resolved(preferredLanguages: ["en-US"]) == AppLanguage(rawValue: "fr"))
             #expect(AppLanguagePreference(rawValue: "fr-CA")?.resolved(preferredLanguages: ["en-US"]) == AppLanguage(rawValue: "fr"))
             #expect(L10n.nativeName(for: AppLanguage(rawValue: "fr")) == "Français")
-            #expect(L10n.speechLocaleIdentifier(for: AppLanguage(rawValue: "fr")) == "fr-FR")
 
             L10n.$overrideLanguage.withValue(AppLanguage(rawValue: "fr")) {
                 #expect(L10n.tr("已关闭", "Off") == "Éteint")
@@ -214,28 +212,6 @@ struct LocalizationTests {
         #expect(L10n.captures(pattern: "已同步 * 台设备", against: "已同步 12 台设备") == ["12"])
         #expect(L10n.captures(pattern: "已同步 * 台设备", against: "别的句子") == nil)
         #expect(L10n.fill("亮度 *%（*）", with: ["60", "书房"]) == "亮度 60%（书房）")
-    }
-
-    @Test("Traditional Chinese timer descriptions use the shipped resource table")
-    func traditionalTimerDescriptions() {
-        L10n.$overrideLanguage.withValue(.zhHant) {
-            #expect(DelayPhrase.describe(30) == "30 秒後")
-            #expect(DelayPhrase.describe(600) == "10 分鐘後")
-            #expect(DelayPhrase.describe(3600) == "1 小時後")
-            #expect(DelayPhrase.describe(5400) == "1 小時 30 分鐘後")
-        }
-        L10n.$overrideLanguage.withValue(.zhHans) {
-            #expect(DelayPhrase.describe(30) == "30 秒后")
-            #expect(DelayPhrase.describe(600) == "10 分钟后")
-            #expect(DelayPhrase.describe(3600) == "1 小时后")
-            #expect(DelayPhrase.describe(5400) == "1 小时 30 分钟后")
-        }
-        L10n.$overrideLanguage.withValue(.en) {
-            #expect(DelayPhrase.describe(30) == "In 30s: ")
-            #expect(DelayPhrase.describe(600) == "In 10m: ")
-            #expect(DelayPhrase.describe(3600) == "In 1h: ")
-            #expect(DelayPhrase.describe(5400) == "In 1h 30m: ")
-        }
     }
 
     // MARK: - Temperature units
@@ -397,69 +373,6 @@ struct LocalizationTests {
                 guard case .climate(let spec) = ac.kind else { return }
                 #expect(spec.targetTemperature == 25.0)
             }
-        }
-    }
-
-    @Test("LocalIntentParser parses English smart home commands and replies in English")
-    func englishLocalIntentParsing() throws {
-        try L10n.$overrideLanguage.withValue(.en) {
-            let onPlan = try #require(AssistantTests.parse("turn on study light"))
-            #expect(onPlan.source == .local)
-            #expect(onPlan.intents == [
-                DeviceIntent(targetId: "dev_study_ceiling", operation: .power(true)),
-                DeviceIntent(targetId: "dev_study_desk", operation: .power(true))
-            ])
-            #expect(onPlan.reply == "Turned on 书房吸顶灯, 书房台灯")
-
-            let moonPlan = try #require(AssistantTests.parse("study light moonlight mode"))
-            #expect(moonPlan.intents == [
-                DeviceIntent(targetId: "dev_study_ceiling", operation: .lightEffect("Night"))
-            ])
-            #expect(moonPlan.reply == "Switched 书房吸顶灯 to Moonlight mode")
-
-            let tempPlan = try #require(L10n.$overrideTemperatureUnit.withValue(.celsius) {
-                AssistantTests.parse("set living room ac to 24 degrees")
-            })
-            #expect(tempPlan.intents == [
-                DeviceIntent(targetId: "dev_living_ac", operation: .targetTemperature(24))
-            ])
-            #expect(tempPlan.reply == "Set 客厅空调 to 24°C")
-            let fahrenheitPlan = try #require(L10n.$overrideTemperatureUnit.withValue(.fahrenheit) {
-                AssistantTests.parse("set living room ac to 24 degrees")
-            })
-            #expect(fahrenheitPlan.intents == tempPlan.intents)
-            #expect(fahrenheitPlan.reply == "Set 客厅空调 to 75.2°F")
-
-            let coolPlan = try #require(AssistantTests.parse("living room ac cool mode"))
-            #expect(coolPlan.intents == [
-                DeviceIntent(targetId: "dev_living_ac", operation: .hvacMode("cool"))
-            ])
-            #expect(coolPlan.reply == "Switched 客厅空调 to Cool")
-
-            let dimPlan = try #require(AssistantTests.parse("dimmer"))
-            #expect(dimPlan.intents == [
-                DeviceIntent(targetId: "dev_bedside", operation: .brightness(60))
-            ])
-        }
-    }
-
-    @Test("DelayPhrase and UndoPhrase support English spoken timers and undo commands")
-    func englishDelayAndUndoPhrases() throws {
-        try L10n.$overrideLanguage.withValue(.en) {
-            let match = try #require(DelayPhrase.extract("in 10 minutes turn off study light"))
-            #expect(match.delay == 600)
-            #expect(match.remainder == "turn off study light")
-            #expect(DelayPhrase.describe(match.delay) == "In 10m: ")
-
-            let secMatch = try #require(DelayPhrase.extract("after 30 seconds turn on bedside lamp"))
-            #expect(secMatch.delay == 30)
-            #expect(secMatch.remainder == "turn on bedside lamp")
-
-            #expect(DelayPhrase.isCancel("cancel timer"))
-            #expect(DelayPhrase.isCancel("clear all timers"))
-            #expect(UndoPhrase.isUndo("undo"))
-            #expect(UndoPhrase.isUndo("undo that"))
-            #expect(UndoPhrase.isUndo("revert"))
         }
     }
 

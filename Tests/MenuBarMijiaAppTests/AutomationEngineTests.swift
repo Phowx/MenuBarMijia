@@ -59,7 +59,6 @@ struct AutomationEngineTests {
 
         #expect(store.devices.first(where: { $0.id == Self.studyLight.id })?.isActiveOn == false)
         #expect(store.undoBanner != nil)
-        #expect(store.userHabitMemory.entries.isEmpty)
         let firstCommands = await mock.executedCommands
         #expect(firstCommands == [.setLightPower(entityId: "light.study", isOn: false)])
 
@@ -101,18 +100,17 @@ struct AutomationEngineTests {
         )
 
         let tracker = UndoAvailabilityTracker()
-        tracker.syncAction(at: store.lastAssistantActionAt)
+        tracker.syncAction(at: store.lastActionAt)
         #expect(tracker.isAvailable)
         #expect(store.devices.first?.isActiveOn == false)
         await tracker.performUndo(store: store)
         #expect(store.devices.first?.isActiveOn == true)
         #expect(!tracker.isAvailable)
-        #expect(store.lastAssistantActionAt == nil)
+        #expect(store.lastActionAt == nil)
         #expect(await mock.executedCommands == [
             .setLightPower(entityId: "light.study", isOn: false),
             .setLightPower(entityId: "light.study", isOn: true)
         ])
-        #expect(store.userHabitMemory.entries.isEmpty)
     }
 
     @Test("Reopening the panel preserves the original ten-minute undo deadline", arguments: [360.0, 601.0])
@@ -166,7 +164,6 @@ struct AutomationEngineTests {
         await engine.handle(trigger: .externalDisplayConnected, at: Date())
         let commands = await mock.executedCommands
         #expect(commands == [.activateScene(entityId: "scene.work")])
-        #expect(store.userHabitMemory.entries.isEmpty)
     }
 
     @Test("A quick-action rule uses the built-in action path and leaves an undo banner")
@@ -184,6 +181,5 @@ struct AutomationEngineTests {
         await engine.handle(trigger: .away, at: Date())
         #expect(store.devices.first(where: { $0.id == Self.studyLight.id })?.isActiveOn == false)
         #expect(store.undoBanner != nil)
-        #expect(store.userHabitMemory.entries.isEmpty)
     }
 }

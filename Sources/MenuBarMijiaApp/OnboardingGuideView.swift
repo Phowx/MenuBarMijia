@@ -8,10 +8,6 @@ public struct OnboardingGuideView: View {
 
     @State private var haURLDraft: String = ""
     @State private var haTokenDraft: String = ""
-    @State private var selectedPreset: AssistantProviderPreset = .openRouterJev
-    @State private var apiKeyDraft: String = ""
-    @State private var voiceAuthorized: Bool = false
-    @State private var isRequestingVoice: Bool = false
 
     public init(store: HomeStore) {
         self.store = store
@@ -31,8 +27,7 @@ public struct OnboardingGuideView: View {
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 10) {
                     step1ConnectionCard
-                    step2JevModelCard
-                    step3VoiceAndShortcutsCard
+                    keyboardGuideCard
                 }
                 .padding(.horizontal, 13)
                 .padding(.vertical, 11)
@@ -49,10 +44,6 @@ public struct OnboardingGuideView: View {
         .onAppear {
             haURLDraft = store.serverURLString
             haTokenDraft = KeychainHelper.loadToken()
-            let currentBase = store.assistantConfig.baseURL
-            selectedPreset = AssistantProviderPreset.infer(baseURL: currentBase)
-            apiKeyDraft = AssistantConfig.userStoredAPIKey(forBaseURL: currentBase)
-            voiceAuthorized = SpeechInputController.shared.hasVoicePermissions
             if store.miSessionMaskedUserId == nil,
                haTokenDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                store.homeBackend == .homeAssistant {
@@ -291,180 +282,16 @@ public struct OnboardingGuideView: View {
         .glassTile(isActive: isBackendConnected, cornerRadius: 12)
     }
 
-    // MARK: - Step 2: AI Decision Model
-
-    private var step2JevModelCard: some View {
-        let effectiveBase = selectedPreset.defaultBaseURL.isEmpty ? store.assistantConfig.baseURL : selectedPreset.defaultBaseURL
-        let hasCustomKey = !apiKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        let importedSource = hasCustomKey ? AssistantConfig.importedKeySource(forBaseURL: effectiveBase) : nil
-        let isLoopback = AssistantConfig(baseURL: effectiveBase, model: selectedPreset.defaultModel, apiKey: "").isLoopbackEndpoint
-        let isReady = hasCustomKey || isLoopback
-
-        return VStack(alignment: .leading, spacing: 7) {
-            HStack(spacing: 6) {
-                stepBadge("2", isDone: isReady)
-                Text(L10n.tr("AI 决策模型（支持 Jev / DeepSeek / 自定义 Key）", "AI Decision Model (Jev / DeepSeek / Custom Key)"))
-                    .font(.system(size: 12, weight: .semibold))
-                Spacer()
-                if let importedSource {
-                    Label(L10n.tr("已从 \(importedSource) 导入", "Imported from \(importedSource)"), systemImage: "checkmark.circle.fill")
-                        .font(.system(size: 10.5, weight: .semibold))
-                        .foregroundStyle(.green)
-                } else if hasCustomKey {
-                    Label(L10n.tr("已配置密钥", "Key Configured"), systemImage: "checkmark.circle.fill")
-                        .font(.system(size: 10.5, weight: .semibold))
-                        .foregroundStyle(.green)
-                } else if isLoopback {
-                    Label(L10n.tr("本机免密接口", "Local Endpoint"), systemImage: "checkmark.circle.fill")
-                        .font(.system(size: 10.5, weight: .semibold))
-                        .foregroundStyle(.green)
-                } else {
-                    Text(L10n.tr("不填也可用本机 0ms 规则", "0ms Local Rules Work Without Key"))
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                }
-            }
-
+    private var keyboardGuideCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(L10n.tr("键盘操作", "Keyboard Controls"))
+                .font(.headline)
             Text(L10n.tr(
-                "常规指令本机 0ms 直接执行；支持 OpenRouter Jev、TypeSafe 原生 Jev、DeepSeek、通义千问、智谱 GLM 等，复杂场景口语一次统筹多台设备。",
-                "Standard commands run locally in 0ms. Configure OpenRouter Jev, Native Jev, DeepSeek, Qwen, GLM, or OpenAI to coordinate complex natural phrases."
+                "⌥M 呼出或收起面板；直接输入名称、房间或拼音搜索设备。↑↓ 选择，回车开关，→ 展开详情，Esc 退出。",
+                "Toggle the panel with ⌥M. Type a name, room or pinyin to search. ↑↓ selects, Return toggles, → opens details, and Esc exits."
             ))
-                .font(.system(size: 10.5))
+                .font(.callout)
                 .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            HStack(spacing: 6) {
-                Picker(
-                    "",
-                    selection: Binding(
-                        get: { selectedPreset },
-                        set: { newPreset in
-                            selectedPreset = newPreset
-                            if newPreset != .custom {
-                                apiKeyDraft = AssistantConfig.userStoredAPIKey(forBaseURL: newPreset.defaultBaseURL)
-                            } else {
-                                apiKeyDraft = AssistantConfig.userStoredAPIKey(forBaseURL: store.assistantConfig.baseURL)
-                            }
-                        }
-                    )
-                ) {
-                    ForEach(AssistantProviderPreset.allCases) { preset in
-                        Text(preset.shortTitle).tag(preset)
-                    }
-                }
-                .labelsHidden()
-                .frame(width: 96)
-                .controlSize(.small)
-
-                SecureField(selectedPreset.keyPlaceholder, text: $apiKeyDraft)
-                    .textFieldStyle(.roundedBorder)
-                    .controlSize(.small)
-                    .font(.system(size: 11, design: .monospaced))
-
-                Button(L10n.tr("保存", "Save")) {
-                    persistOnboardingAssistantDraft()
-                    store.showToast(L10n.tr("已保存 \(selectedPreset.shortTitle) 配置", "Saved \(selectedPreset.shortTitle) config"))
-                }
-                .buttonStyle(PillActionButtonStyle(isSelected: !apiKeyDraft.isEmpty, tintColor: .accentColor))
-            }
-
-            if selectedPreset.supportsKeyImport && !hasCustomKey {
-                Button(L10n.tr("已在 CodexBar 或环境变量里配过？点此导入 Key", "Already set up in CodexBar or env vars? Import the key")) {
-                    if let label = AssistantConfig.importAmbientAPIKey(forBaseURL: effectiveBase) {
-                        apiKeyDraft = AssistantConfig.userStoredAPIKey(forBaseURL: effectiveBase)
-                        store.showToast(L10n.tr("已从 \(label) 导入 \(selectedPreset.shortTitle) 的 Key", "Imported the \(selectedPreset.shortTitle) key from \(label)"))
-                    } else {
-                        store.showToast(
-                            L10n.tr("CodexBar 和环境变量里都没有 \(selectedPreset.shortTitle) 的 Key", "No \(selectedPreset.shortTitle) key in CodexBar or environment variables"),
-                            isError: true
-                        )
-                    }
-                }
-                .buttonStyle(.plain)
-                .font(.system(size: 10.5, weight: .medium))
-                .foregroundStyle(Color.accentColor)
-            }
-        }
-        .padding(11)
-        .glassTile(isActive: false, cornerRadius: 12)
-    }
-
-    private func persistOnboardingAssistantDraft() {
-        let base = selectedPreset.defaultBaseURL.isEmpty ? store.assistantConfig.baseURL : selectedPreset.defaultBaseURL
-        let model = selectedPreset.defaultModel.isEmpty ? store.assistantConfig.model : selectedPreset.defaultModel
-        store.assistantConfig = AssistantConfig(
-            baseURL: base,
-            model: model,
-            apiKey: apiKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        )
-    }
-
-    // MARK: - Step 3: Hold-to-Talk & Shortcuts
-
-    private var step3VoiceAndShortcutsCard: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack(spacing: 6) {
-                stepBadge("3", isDone: voiceAuthorized)
-                Text(L10n.tr("解锁「按住菜单栏直接说话」", "Unlock Hold-to-Talk & Shortcuts"))
-                    .font(.system(size: 12, weight: .semibold))
-                Spacer()
-                if voiceAuthorized {
-                    Label(L10n.tr("语音已授权", "Voice Authorized"), systemImage: "checkmark.circle.fill")
-                        .font(.system(size: 10.5, weight: .semibold))
-                        .foregroundStyle(.green)
-                }
-            }
-
-            VStack(alignment: .leading, spacing: 5) {
-                shortcutTipRow(
-                    icon: "waveform.badge.mic",
-                    title: L10n.tr("长按顶部菜单栏温度/图标", "Long-Press Menu Bar Icon"),
-                    detail: L10n.tr(
-                        "按住直接说出指令（如「书房灯月光模式」「10分钟后关灯」），松手即执行",
-                        "Hold and speak a command (e.g. \"study light moonlight mode\", \"in 10 minutes turn off lights\"), release to run"
-                    )
-                )
-                shortcutTipRow(
-                    icon: "command",
-                    title: L10n.tr("全局快捷键 ⌥M 与数字键 1–9", "Global Hotkey ⌥M & Keys 1–9"),
-                    detail: L10n.tr(
-                        "短按 ⌥M 呼出面板，长按 ⌥M 直接说话，按 1–9 瞬间开关常用设备，说「撤销」可回退",
-                        "Tap ⌥M to toggle the dashboard, hold ⌥M to speak, 1–9 to toggle top devices, or say \"undo\" to revert"
-                    )
-                )
-            }
-
-            if !voiceAuthorized {
-                HStack {
-                    Spacer()
-                    Button {
-                        isRequestingVoice = true
-                        Task { @MainActor in
-                            let granted = await SpeechInputController.shared.requestPermissions()
-                            voiceAuthorized = granted
-                            isRequestingVoice = false
-                            if granted {
-                                store.showToast(L10n.tr("已开启麦克风与语音识别权限", "Microphone & Speech Recognition enabled"))
-                            } else {
-                                store.showToast(
-                                    L10n.tr("可在「系统设置 → 隐私与安全性」中开启权限", "Enable permissions in System Settings → Privacy & Security"),
-                                    isError: true
-                                )
-                            }
-                        }
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "mic.fill")
-                            Text(isRequestingVoice
-                                 ? L10n.tr("正在请求系统授权…", "Requesting Authorization…")
-                                 : L10n.tr("一键授权麦克风与语音", "Authorize Microphone & Speech"))
-                        }
-                    }
-                    .buttonStyle(PillActionButtonStyle(isSelected: true, tintColor: .orange))
-                    .disabled(isRequestingVoice)
-                }
-                .padding(.top, 2)
-            }
         }
         .padding(11)
         .glassTile(isActive: false, cornerRadius: 12)
@@ -481,11 +308,6 @@ public struct OnboardingGuideView: View {
             Spacer()
 
             Button {
-                let trimmedKey = apiKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-                let currentPreset = AssistantProviderPreset.infer(baseURL: store.assistantConfig.baseURL)
-                if !trimmedKey.isEmpty || selectedPreset != currentPreset {
-                    persistOnboardingAssistantDraft()
-                }
                 withAnimation(AppleMotion.snappySpring) {
                     store.completeOnboarding()
                 }
