@@ -7,9 +7,7 @@ use home_assistant::{ha_execute, ha_snapshot};
 static ORIGIN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use ring::digest::{digest, SHA256};
-use ring::signature::{UnparsedPublicKey, ED25519};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -35,14 +33,12 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 struct TrayAndHotkeyState {
     active_shortcut: Option<Shortcut>,
     shortcut_label: Option<String>,
-    update_version: Option<String>,
 }
 
 static TRAY_AND_HOTKEY_STATE: LazyLock<RwLock<TrayAndHotkeyState>> = LazyLock::new(|| {
     RwLock::new(TrayAndHotkeyState {
         active_shortcut: None,
         shortcut_label: Some("Alt+M".to_string()),
-        update_version: None,
     })
 });
 
@@ -96,12 +92,8 @@ const BUILT_IN_HOST_SUFFIXES: &[&str] = &[
     "account.xiaomi.com",
     "api.io.mi.com",
     "miot-spec.org",
-    // Public release metadata for the update check (#39); no credentials are sent.
-    "api.github.com",
 ];
 
-/// Windows release page opened from the tray/update row (#39).
-const RELEASE_PAGE_URL: &str = "https://github.com/jryang1997/MenuBarMijia/releases/latest";
 
 fn normalize_host(raw: &str) -> String {
     raw.trim()
@@ -217,483 +209,23 @@ fn tray_labels_for_shortcut(shortcut_label: Option<&str>) -> (String, String) {
     }
 }
 
-/// Rebuilds the tray menu, adding the "有新版本" entry only when a release is known (#39)
-/// and showing the active global shortcut when enabled (#43).
-fn build_tray_menu(
-    app: &AppHandle,
-    shortcut_label: Option<&str>,
-    update_version: Option<&str>,
-) -> tauri::Result<Menu<tauri::Wry>> {
+fn build_tray_menu(app: &AppHandle, shortcut_label: Option<&str>) -> tauri::Result<Menu<tauri::Wry>> {
     let (toggle_text, _) = tray_labels_for_shortcut(shortcut_label);
-    let mut builder = MenuBuilder::new(app).text("toggle", toggle_text);
-    if let Some(version) = update_version {
-        builder = builder.text("update", format!("有新版本 v{version}，点击查看"));
-    }
-    builder.text("quit", "退出 MenuBarMijia").build()
+    MenuBuilder::new(app)
+        .text("toggle", toggle_text)
+        .text("quit", "退出 MenuBarMijia")
+        .build()
 }
 
-fn refresh_tray_chrome(app: &AppHandle, shortcut_label: Option<&str>, update_version: Option<&str>) {
+fn refresh_tray_chrome(app: &AppHandle, shortcut_label: Option<&str>) {
     let Some(tray) = app.tray_by_id("main-tray") else {
         return;
     };
     let (_, tooltip) = tray_labels_for_shortcut(shortcut_label);
     let _ = tray.set_tooltip(Some(tooltip));
-    if let Ok(menu) = build_tray_menu(app, shortcut_label, update_version) {
+    if let Ok(menu) = build_tray_menu(app, shortcut_label) {
         let _ = tray.set_menu(Some(menu));
     }
-}
-
-/// The only external URL the frontend may open: a MenuBarMijia release page on GitHub.
-fn validated_release_url(raw: &str) -> Result<String, String> {
-    let url = reqwest::Url::parse(raw).map_err(|_| "更新页面地址无效".to_string())?;
-    if url.scheme() != "https" {
-        return Err("更新页面只允许 https 地址".to_string());
-    }
-    let host = url
-        .host_str()
-        .map(normalize_host)
-        .unwrap_or_default();
-    if host != "github.com" {
-        return Err(format!("拒绝打开非 GitHub 地址：{host}"));
-    }
-    if !url.path().starts_with("/jryang1997/MenuBarMijia/releases") {
-        return Err("拒绝打开非 MenuBarMijia 发布页".to_string());
-    }
-    Ok(url.to_string())
-}
-
-#[cfg(windows)]
-#[link(name = "shell32")]
-extern "system" {
-    fn ShellExecuteW(
-        hwnd: *mut core::ffi::c_void,
-        operation: *const u16,
-        file: *const u16,
-        parameters: *const u16,
-        directory: *const u16,
-        show_cmd: i32,
-    ) -> isize;
-}
-
-#[cfg(windows)]
-fn open_url_in_browser(url: &str) {
-    use std::os::windows::ffi::OsStrExt;
-
-    let wide = |value: &str| -> Vec<u16> {
-        std::ffi::OsStr::new(value)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
-    };
-    let operation = wide("open");
-    let file = wide(url);
-    // ShellExecuteW returns a value > 32 on success; a failure has no useful recovery here.
-    unsafe {
-        ShellExecuteW(
-            std::ptr::null_mut(),
-            operation.as_ptr(),
-            file.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            1,
-        );
-    }
-}
-
-#[cfg(not(windows))]
-fn open_url_in_browser(_url: &str) {}
-
-#[tauri::command]
-fn open_release_page(url: String) -> Result<(), String> {
-    let target = validated_release_url(&url)?;
-    open_url_in_browser(&target);
-    Ok(())
-}
-
-/// Offline Ed25519 public key (32-byte raw, base64) shared with `UpdateChecker.updateSigningPublicKeyBase64` (ADR-0005).
-const UPDATE_SIGNING_PUBLIC_KEY_BASE64: &str = "rLwWXuP0sOZvgd/KusLTTmBXN9DAZ9EzPBNhFSn9yUo=";
-const STAGED_INSTALLER_PREFIX: &str = "MenuBarMijia-update-";
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct InstallerAssetPayload {
-    name: String,
-    download_url: String,
-    #[allow(dead_code)]
-    #[serde(default)]
-    size_bytes: u64,
-    sha256: Option<String>,
-    checksum_url: Option<String>,
-    signature_url: String,
-}
-
-/// Validates a GitHub release download URL for MenuBarMijia installer, `.sha256`, or `.ed25519.sig` sidecar assets.
-fn validated_release_asset_url(raw: &str) -> Result<reqwest::Url, String> {
-    let url = reqwest::Url::parse(raw.trim()).map_err(|_| "更新包下载地址无效".to_string())?;
-    if url.scheme() != "https"
-        || url.port_or_known_default() != Some(443)
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err("更新包地址必须是无附加参数的 https://github.com 地址".to_string());
-    }
-    let host = url.host_str().map(normalize_host).unwrap_or_default();
-    if host != "github.com" {
-        return Err(format!("拒绝从非 GitHub 地址下载更新包：{host}"));
-    }
-    if !url
-        .path()
-        .starts_with("/jryang1997/MenuBarMijia/releases/download/")
-    {
-        return Err("拒绝下载非 MenuBarMijia 官方发布附件".to_string());
-    }
-    Ok(url)
-}
-
-fn release_asset_redirect_allowed(next: &reqwest::Url) -> bool {
-    if next.scheme() != "https"
-        || next.port_or_known_default() != Some(443)
-        || !next.username().is_empty()
-        || next.password().is_some()
-    {
-        return false;
-    }
-    let host = next.host_str().map(normalize_host).unwrap_or_default();
-    host == "github.com"
-        || host == "githubusercontent.com"
-        || host.ends_with(".githubusercontent.com")
-}
-
-fn parse_sha256_hex(raw: &str) -> Option<String> {
-    let token = raw.split_whitespace().next()?;
-    let candidate = token
-        .strip_prefix("sha256:")
-        .or_else(|| token.strip_prefix("SHA256:"))
-        .unwrap_or(token)
-        .to_ascii_lowercase();
-    if candidate.len() == 64 && candidate.chars().all(|c| c.is_ascii_hexdigit()) {
-        Some(candidate)
-    } else {
-        None
-    }
-}
-
-fn sanitize_installer_filename(raw: &str) -> Result<String, String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty()
-        || trimmed.contains('/')
-        || trimmed.contains('\\')
-        || trimmed.contains(':')
-        || trimmed.contains("..")
-        || trimmed.chars().any(|c| c.is_control())
-    {
-        return Err("更新安装包文件名无效".to_string());
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    if !lower.ends_with(".exe") && !lower.ends_with(".msi") {
-        return Err("仅支持 .exe 或 .msi 安装包".to_string());
-    }
-    Ok(trimmed.to_string())
-}
-
-fn compute_sha256_hex(bytes: &[u8]) -> String {
-    let sum = digest(&SHA256, bytes);
-    let mut out = String::with_capacity(64);
-    for byte in sum.as_ref() {
-        use std::fmt::Write;
-        let _ = write!(&mut out, "{byte:02x}");
-    }
-    out
-}
-
-/// Decodes standard RFC 4648 base64 (ignoring surrounding whitespace).
-fn decode_base64_strict(raw: &str) -> Option<Vec<u8>> {
-    let cleaned: Vec<u8> = raw
-        .bytes()
-        .filter(|b| !b.is_ascii_whitespace())
-        .collect();
-    if cleaned.is_empty() || cleaned.len() % 4 != 0 {
-        return None;
-    }
-    fn val(b: u8) -> Option<u8> {
-        match b {
-            b'A'..=b'Z' => Some(b - b'A'),
-            b'a'..=b'z' => Some(b - b'a' + 26),
-            b'0'..=b'9' => Some(b - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-    let mut out = Vec::with_capacity((cleaned.len() / 4) * 3);
-    for (idx, chunk) in cleaned.chunks_exact(4).enumerate() {
-        let is_last = idx + 1 == cleaned.len() / 4;
-        let a = val(chunk[0])?;
-        let b = val(chunk[1])?;
-        match (chunk[2], chunk[3]) {
-            (b'=', b'=') if is_last => {
-                if (b & 0x0f) != 0 {
-                    return None;
-                }
-                out.push((a << 2) | (b >> 4));
-            }
-            (c_byte, b'=') if is_last => {
-                let c = val(c_byte)?;
-                if (c & 0x03) != 0 {
-                    return None;
-                }
-                out.push((a << 2) | (b >> 4));
-                out.push((b << 4) | (c >> 2));
-            }
-            (b'=', _) | (_, b'=') => return None,
-            (c_byte, d_byte) => {
-                let c = val(c_byte)?;
-                let d = val(d_byte)?;
-                out.push((a << 2) | (b >> 4));
-                out.push((b << 4) | (c >> 2));
-                out.push((c << 6) | d);
-            }
-        }
-    }
-    Some(out)
-}
-
-/// Verifies a detached Ed25519 signature over `data` against `public_key_base64` (ADR-0005).
-fn verify_ed25519_signature(
-    signature_base64: &str,
-    public_key_base64: &str,
-    data: &[u8],
-) -> Result<(), String> {
-    let trimmed_sig = signature_base64.trim();
-    if trimmed_sig.is_empty() {
-        return Err("更新包缺少 Ed25519 数字签名（.ed25519.sig），已中止安装".to_string());
-    }
-    let key_bytes = decode_base64_strict(public_key_base64)
-        .filter(|bytes| bytes.len() == 32)
-        .ok_or_else(|| "内置 Ed25519 更新公钥无效".to_string())?;
-    let sig_bytes = decode_base64_strict(trimmed_sig)
-        .filter(|bytes| bytes.len() == 64)
-        .ok_or_else(|| "更新包 Ed25519 数字签名格式无效，已中止安装".to_string())?;
-    let public_key = UnparsedPublicKey::new(&ED25519, key_bytes);
-    public_key
-        .verify(data, &sig_bytes)
-        .map_err(|_| "更新包 Ed25519 数字签名校验失败：签名与安装包内容不匹配，已中止安装".to_string())
-}
-
-fn sweep_stale_update_installers() {
-    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        if name
-            .to_str()
-            .is_some_and(|s| s.starts_with(STAGED_INSTALLER_PREFIX))
-        {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
-}
-
-fn elevated_launch_powershell_command(is_msi: bool) -> &'static str {
-    if is_msi {
-        "Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', $env:MIJIA_INSTALLER_PATH) -Verb RunAs -ErrorAction Stop"
-    } else {
-        "Start-Process -FilePath $env:MIJIA_INSTALLER_PATH -Verb RunAs -ErrorAction Stop"
-    }
-}
-
-fn launch_installer(installer_path: &std::path::Path) -> Result<(), String> {
-    let is_msi = installer_path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("msi"));
-    let mut cmd = if is_msi {
-        let mut c = std::process::Command::new("msiexec");
-        c.arg("/i").arg(installer_path);
-        c
-    } else {
-        std::process::Command::new(installer_path)
-    };
-    match cmd.spawn() {
-        Ok(mut child) => {
-            std::thread::sleep(Duration::from_millis(250));
-            if let Ok(Some(status)) = child.try_wait() {
-                if !status.success() {
-                    return Err(format!("安装程序未能正常启动（退出码 {:?}）", status.code()));
-                }
-            }
-            Ok(())
-        }
-        Err(err) if err.raw_os_error() == Some(740) => {
-            // ERROR_ELEVATION_REQUIRED (740): invoke ShellExecute with -Verb RunAs so UAC prompts
-            // and wait for Start-Process to finish spawning the elevated installer (or fail if declined).
-            let status = std::process::Command::new("powershell")
-                .args([
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-WindowStyle",
-                    "Hidden",
-                    "-Command",
-                    elevated_launch_powershell_command(is_msi),
-                ])
-                .env("MIJIA_INSTALLER_PATH", installer_path)
-                .status()
-                .map_err(|e| format!("启动安装程序失败：{e}"))?;
-            if !status.success() {
-                return Err(format!(
-                    "启动安装程序失败（未获管理员授权或启动被取消，退出码 {:?}）",
-                    status.code()
-                ));
-            }
-            Ok(())
-        }
-        Err(err) => Err(format!("启动安装程序失败：{err}")),
-    }
-}
-
-#[tauri::command]
-async fn install_update(app: AppHandle, asset: InstallerAssetPayload) -> Result<(), String> {
-    let asset_url = validated_release_asset_url(&asset.download_url)?;
-    let lower_path = asset_url.path().to_ascii_lowercase();
-    if !lower_path.ends_with(".exe") && !lower_path.ends_with(".msi") {
-        return Err("更新包地址必须指向 .exe 或 .msi 安装程序".to_string());
-    }
-    let safe_name = sanitize_installer_filename(&asset.name)?;
-    let sig_url = validated_release_asset_url(&asset.signature_url)?;
-    if !sig_url.path().to_ascii_lowercase().ends_with(".ed25519.sig") {
-        return Err("更新签名文件地址必须以 .ed25519.sig 结尾".to_string());
-    }
-
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= 5 {
-                return attempt.stop();
-            }
-            if release_asset_redirect_allowed(attempt.url()) {
-                attempt.follow()
-            } else {
-                attempt.stop()
-            }
-        }))
-        .timeout(Duration::from_secs(120))
-        .user_agent("MenuBarMijia-Windows")
-        .build()
-        .map_err(|err| format!("无法初始化下载客户端：{err}"))?;
-
-    let expected_hex = if let Some(inline) = asset
-        .sha256
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-    {
-        parse_sha256_hex(inline).ok_or_else(|| "更新包 SHA-256 摘要格式无效".to_string())?
-    } else if let Some(sidecar_raw) = asset
-        .checksum_url
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-    {
-        let sidecar_url = validated_release_asset_url(sidecar_raw)?;
-        if !sidecar_url.path().to_ascii_lowercase().ends_with(".sha256") {
-            return Err("校验文件地址必须以 .sha256 结尾".to_string());
-        }
-        let resp = client
-            .get(sidecar_url)
-            .send()
-            .await
-            .map_err(|err| format!("下载 SHA-256 校验文件失败：{err}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("下载 SHA-256 校验文件失败（HTTP {}）", resp.status().as_u16()));
-        }
-        let text = resp
-            .text()
-            .await
-            .map_err(|err| format!("读取 SHA-256 校验文件失败：{err}"))?;
-        parse_sha256_hex(&text).ok_or_else(|| "无法解析 SHA-256 校验文件".to_string())?
-    } else {
-        return Err("缺少更新包 SHA-256 校验信息，已中止安装".to_string());
-    };
-
-    let sig_resp = client
-        .get(sig_url)
-        .send()
-        .await
-        .map_err(|err| format!("下载 Ed25519 更新签名失败：{err}"))?;
-    if sig_resp.status().as_u16() == 404 {
-        return Err("更新包缺少 Ed25519 数字签名（.ed25519.sig），已中止安装".to_string());
-    }
-    if !sig_resp.status().is_success() {
-        return Err(format!(
-            "下载 Ed25519 更新签名失败（HTTP {}）",
-            sig_resp.status().as_u16()
-        ));
-    }
-    let sig_text = sig_resp
-        .text()
-        .await
-        .map_err(|err| format!("读取 Ed25519 更新签名失败：{err}"))?;
-
-    let response = client
-        .get(asset_url)
-        .send()
-        .await
-        .map_err(|err| format!("下载更新安装包失败：{err}"))?;
-    if !response.status().is_success() {
-        return Err(format!("下载更新安装包失败（HTTP {}）", response.status().as_u16()));
-    }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|err| format!("读取更新安装包数据失败：{err}"))?;
-
-    let actual_hex = compute_sha256_hex(&bytes);
-    if actual_hex != expected_hex {
-        return Err(format!(
-            "安装包 SHA-256 校验失败（期望 {}…，实际 {}…），已中止安装",
-            &expected_hex[..12],
-            &actual_hex[..12]
-        ));
-    }
-
-    verify_ed25519_signature(&sig_text, UPDATE_SIGNING_PUBLIC_KEY_BASE64, &bytes)?;
-
-    sweep_stale_update_installers();
-    let installer_path = std::env::temp_dir().join(format!(
-        "{STAGED_INSTALLER_PREFIX}{}-{safe_name}",
-        std::process::id()
-    ));
-    std::fs::write(&installer_path, &bytes)
-        .map_err(|err| format!("写入临时安装程序失败：{err}"))?;
-
-    if let Err(err) = launch_installer(&installer_path) {
-        let _ = std::fs::remove_file(&installer_path);
-        return Err(err);
-    }
-
-    let app_for_exit = app.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(150));
-        app_for_exit.exit(0);
-    });
-    Ok(())
-}
-
-#[tauri::command]
-fn set_update_available(app: AppHandle, version: Option<String>) -> Result<(), String> {
-    let shortcut_label = {
-        let mut guard = TRAY_AND_HOTKEY_STATE
-            .write()
-            .map_err(|_| "托盘状态不可用".to_string())?;
-        guard.update_version = version.clone();
-        guard.shortcut_label.clone()
-    };
-    let tray = app
-        .tray_by_id("main-tray")
-        .ok_or_else(|| "托盘尚未就绪".to_string())?;
-    let menu = build_tray_menu(&app, shortcut_label.as_deref(), version.as_deref())
-        .map_err(|error| error.to_string())?;
-    tray.set_menu(Some(menu)).map_err(|error| error.to_string())
 }
 
 /// Applies the user's global shortcut preference (#43), adhering to Coding Standard #3:
@@ -701,11 +233,11 @@ fn set_update_available(app: AppHandle, version: Option<String>) -> Result<(), S
 /// any previous hotkey before registering the new one and surfaces conflicts as `Err`.
 #[tauri::command]
 fn set_global_shortcut(app: AppHandle, enabled: bool, shortcut: String) -> Result<(), String> {
-    let (old_shortcut, update_version) = {
+    let old_shortcut = {
         let guard = TRAY_AND_HOTKEY_STATE
             .read()
             .map_err(|_| "快捷键状态不可用".to_string())?;
-        (guard.active_shortcut, guard.update_version.clone())
+        guard.active_shortcut
     };
 
     if !enabled {
@@ -716,7 +248,7 @@ fn set_global_shortcut(app: AppHandle, enabled: bool, shortcut: String) -> Resul
             guard.active_shortcut = None;
             guard.shortcut_label = None;
         }
-        refresh_tray_chrome(&app, None, update_version.as_deref());
+        refresh_tray_chrome(&app, None);
         return Ok(());
     }
 
@@ -725,7 +257,7 @@ fn set_global_shortcut(app: AppHandle, enabled: bool, shortcut: String) -> Resul
         if let Ok(mut guard) = TRAY_AND_HOTKEY_STATE.write() {
             guard.shortcut_label = Some(label.clone());
         }
-        refresh_tray_chrome(&app, Some(&label), update_version.as_deref());
+        refresh_tray_chrome(&app, Some(&label));
         return Ok(());
     }
 
@@ -738,7 +270,7 @@ fn set_global_shortcut(app: AppHandle, enabled: bool, shortcut: String) -> Resul
             guard.active_shortcut = None;
             guard.shortcut_label = None;
         }
-        refresh_tray_chrome(&app, None, update_version.as_deref());
+        refresh_tray_chrome(&app, None);
         return Err(format!("这个组合已被其他应用占用或无法注册（{err}），换一个再试。"));
     }
 
@@ -746,7 +278,7 @@ fn set_global_shortcut(app: AppHandle, enabled: bool, shortcut: String) -> Resul
         guard.active_shortcut = Some(parsed);
         guard.shortcut_label = Some(label.clone());
     }
-    refresh_tray_chrome(&app, Some(&label), update_version.as_deref());
+    refresh_tray_chrome(&app, Some(&label));
     Ok(())
 }
 
@@ -952,12 +484,11 @@ fn decide_service_origins(
 }
 
 fn authorize_service_endpoints(
-    assistant_url: &str,
     ha_url: &str,
     confirm: impl Fn(&str) -> bool,
 ) -> Result<(), String> {
     let current = allowed_origins_snapshot()?;
-    let next = decide_service_origins(&current, assistant_url, ha_url, confirm)?;
+    let next = decide_service_origins(&current, "", ha_url, confirm)?;
     store_authorized(&next)
 }
 
@@ -971,7 +502,7 @@ fn user_confirms_origin(origin: &str) -> bool {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     let text = format!(
-        "允许 MenuBarMijia 连接这个地址吗？\n\n{origin}\n\n只有你在设置里填写的 Home Assistant 或 AI 服务地址才应该出现在这里。"
+        "允许 MenuBarMijia 连接这个地址吗？\n\n{origin}\n\n请确认这是你在设置里填写的 Home Assistant 地址。"
     );
     let text_wide: Vec<u16> = OsStr::new(&text).encode_wide().chain(std::iter::once(0)).collect();
     let title_wide: Vec<u16> = OsStr::new("MenuBarMijia").encode_wide().chain(std::iter::once(0)).collect();
@@ -1004,8 +535,8 @@ fn user_confirms_origin(_origin: &str) -> bool {
 }
 
 #[tauri::command]
-fn set_service_endpoints(assistant_url: String, ha_url: String) -> Result<(), String> {
-    authorize_service_endpoints(&assistant_url, &ha_url, user_confirms_origin)
+fn set_service_endpoints(ha_url: String) -> Result<(), String> {
+    authorize_service_endpoints(&ha_url, user_confirms_origin)
 }
 
 #[tauri::command]
@@ -1055,46 +586,48 @@ fn set_pin_popover(pin: bool) {
     PIN_POPOVER.store(pin, Ordering::SeqCst);
 }
 
-static GROK_SIDE_LEFT: AtomicBool = AtomicBool::new(false);
+const DEFAULT_PANEL_SIZE: (f64, f64) = (480.0, 620.0);
+const MIN_PANEL_SIZE: (f64, f64) = (360.0, 380.0);
+static PANEL_SIZE: RwLock<(f64, f64)> = RwLock::new(DEFAULT_PANEL_SIZE);
 
-fn panel_sidecar_on_left(room_left: f64, room_right: f64, scale: f64) -> bool {
-    if room_right >= (232.0 + 20.0) * scale {
-        false
-    } else if room_left >= (232.0 + 12.0) * scale {
-        true
-    } else {
-        room_left > room_right
+#[tauri::command]
+fn set_panel_size(app: AppHandle, width: f64, height: f64, apply: bool) -> Result<(), String> {
+    if !width.is_finite() || !height.is_finite() || width < MIN_PANEL_SIZE.0 || (height != 0.0 && height < MIN_PANEL_SIZE.1) {
+        return Err("Invalid panel size".into());
     }
+    *PANEL_SIZE.write().map_err(|err| err.to_string())? = (width, height);
+    if apply {
+        if let Some(window) = app.get_webview_window("main") {
+            position_popover(&window, None);
+        }
+    }
+    Ok(())
 }
 
-/// Keep the main card column fixed while reserving space for the side-mounted assistant.
 #[tauri::command]
-fn set_panel_height(app: AppHandle, height: f64, expanded: bool, side_left: bool) -> bool {
-    let Some(window) = app.get_webview_window("main") else { return side_left };
-    let monitor = window.current_monitor().ok().flatten().or_else(|| window.primary_monitor().ok().flatten());
-    let scale = monitor.as_ref().map(|m| m.scale_factor()).unwrap_or(1.0);
-    let screen_h = monitor.as_ref().map(|m| m.size().height as f64 / scale).unwrap_or(900.0);
-    let max_h = (screen_h - 54.0 - 24.0).max(480.0);
-    let target_h = if height <= 0.0 { max_h } else { height.min(max_h) };
-    let old_pos = window.outer_position().unwrap_or(PhysicalPosition::new(0, 0));
-    let old_size = window.outer_size().unwrap_or(PhysicalSize::new(480, 520));
-    let main_width = 472.0 * scale;
-    let main_x = old_pos.x as f64 + if side_left { (old_size.width as f64 - main_width - 8.0 * scale).max(0.0) } else { 0.0 };
-    let left = monitor.as_ref().map(|m| m.position().x as f64).unwrap_or(0.0) + 12.0 * scale;
-    let right = monitor.as_ref().map(|m| (m.position().x as f64) + m.size().width as f64).unwrap_or(1920.0 * scale) - 12.0 * scale;
-    let room_right = right - main_x - main_width;
-    let room_left = main_x - left;
-    let on_left = panel_sidecar_on_left(room_left, room_right, scale);
-    let rail_width: f64 = if expanded { 232.0 } else { 84.0 };
-    let target_w = (472.0 + rail_width + 20.0).min((right - left) / scale);
-    let desired_x = main_x - if on_left { (rail_width + 12.0) * scale } else { 0.0 };
-    let x = desired_x.clamp(left, (right - target_w * scale).max(left));
-    let top = monitor.as_ref().map(|m| m.position().y).unwrap_or(0) + (12.0 * scale) as i32;
-    let y = (old_pos.y + old_size.height as i32 - (target_h * scale) as i32).max(top);
-    let _ = window.set_size(tauri::LogicalSize::new(target_w, target_h));
-    let _ = window.set_position(PhysicalPosition::new(x.round() as i32, y));
-    GROK_SIDE_LEFT.store(on_left, Ordering::SeqCst);
-    on_left
+fn resize_panel(window: WebviewWindow, width: f64, height: f64) -> Result<(f64, f64), String> {
+    if !width.is_finite() || !height.is_finite() {
+        return Err("Invalid panel size".into());
+    }
+    let monitor = window.current_monitor().map_err(|err| err.to_string())?
+        .ok_or_else(|| "Panel monitor unavailable".to_string())?;
+    let position = window.outer_position().map_err(|err| err.to_string())?;
+    let size = window.outer_size().map_err(|err| err.to_string())?;
+    let area = monitor.work_area();
+    let scale = monitor.scale_factor();
+    let margin = (8.0 * scale).round() as i32;
+    // Keep the lower-right corner fixed and constrain the drag to the work area.
+    let width_limit = (position.x + size.width as i32 + margin - area.position.x)
+        .clamp(1, area.size.width as i32);
+    let height_limit = (position.y + size.height as i32 + margin - area.position.y)
+        .clamp(1, area.size.height as i32);
+    let desired = (width.max(MIN_PANEL_SIZE.0), height.max(MIN_PANEL_SIZE.1));
+    let (position, size) = panel_bounds(
+        area.position, PhysicalSize::new(width_limit as u32, height_limit as u32), scale, desired, None,
+    );
+    window.set_position(position).map_err(|err| err.to_string())?;
+    window.set_size(size).map_err(|err| err.to_string())?;
+    Ok((size.width as f64 / scale, size.height as f64 / scale))
 }
 
 #[tauri::command]
@@ -1415,51 +948,43 @@ fn spawn_cs2_udp_relay(
     Ok((relay_port, stop))
 }
 
+fn panel_bounds(
+    position: PhysicalPosition<i32>,
+    area: PhysicalSize<u32>,
+    scale: f64,
+    desired: (f64, f64),
+    anchor: Option<PhysicalPosition<f64>>,
+) -> (PhysicalPosition<i32>, PhysicalSize<u32>) {
+    let margin = (8.0 * scale).round() as i32;
+    let left = position.x + margin;
+    let top = position.y + margin;
+    let right = (position.x + area.width as i32 - margin).max(left + 1);
+    let bottom = (position.y + area.height as i32 - margin).max(top + 1);
+    let width = ((desired.0 * scale).round() as i32).clamp(1, right - left);
+    let height = if desired.1 == 0.0 {
+        bottom - top
+    } else {
+        ((desired.1 * scale).round() as i32).clamp(1, bottom - top)
+    };
+    let (x, y) = anchor
+        .map(|point| (point.x.round() as i32 - width / 2, point.y.round() as i32 - height - margin))
+        .unwrap_or((right - width, bottom - height));
+    let origin = PhysicalPosition::new(x.clamp(left, right - width), y.clamp(top, bottom - height));
+    (origin, PhysicalSize::new(width as u32, height as u32))
+}
+
 fn position_popover(window: &WebviewWindow, anchor: Option<PhysicalPosition<f64>>) {
-    let win_size = window.outer_size().unwrap_or(PhysicalSize::new(480, 520));
-    let win_w = win_size.width as i32;
-    let win_h = win_size.height as i32;
-
-    let monitor = window
-        .current_monitor()
-        .ok()
-        .flatten()
+    let point = anchor.or_else(|| window.cursor_position().ok());
+    let monitor = point
+        .and_then(|point| window.monitor_from_point(point.x, point.y).ok().flatten())
+        .or_else(|| window.current_monitor().ok().flatten())
         .or_else(|| window.primary_monitor().ok().flatten());
-
-    if let Some(mon) = monitor {
-        let mon_pos = mon.position();
-        let mon_size = mon.size();
-        let scale = mon.scale_factor();
-        let margin = (12.0 * scale) as i32;
-        let taskbar_offset = (54.0 * scale) as i32;
-
-        let min_x = mon_pos.x + margin;
-        let max_x = (mon_pos.x + mon_size.width as i32 - win_w - margin).max(min_x);
-        let min_y = mon_pos.y + margin;
-        let max_y = (mon_pos.y + mon_size.height as i32 - win_h - taskbar_offset).max(min_y);
-
-        if let Some(pos) = anchor {
-            let main_w = (472.0 * scale).round() as i32;
-            let main_offset = if GROK_SIDE_LEFT.load(Ordering::SeqCst) {
-                (win_w - main_w - (8.0 * scale).round() as i32).max(0)
-            } else {
-                0
-            };
-            let target_x = (pos.x as i32 - main_offset - main_w / 2).clamp(min_x, max_x);
-            let above_tray_y = pos.y as i32 - win_h - margin;
-            let target_y = if above_tray_y >= min_y {
-                above_tray_y.min(max_y)
-            } else {
-                max_y
-            };
-            let _ = window.set_position(PhysicalPosition::new(target_x, target_y));
-        } else {
-            let _ = window.set_position(PhysicalPosition::new(max_x, max_y));
-        }
-    } else if let Some(pos) = anchor {
-        let x = (pos.x as i32 - win_w / 2).max(16);
-        let y = (pos.y as i32 - win_h - 16).max(16);
-        let _ = window.set_position(PhysicalPosition::new(x, y));
+    if let Some(monitor) = monitor {
+        let work_area = monitor.work_area();
+        let desired = PANEL_SIZE.read().map(|size| *size).unwrap_or(DEFAULT_PANEL_SIZE);
+        let (position, size) = panel_bounds(work_area.position, work_area.size, monitor.scale_factor(), desired, anchor);
+        let _ = window.set_position(position);
+        let _ = window.set_size(size);
     }
 }
 
@@ -1518,18 +1043,15 @@ fn main() {
             secure_store_delete,
             hide_panel,
             quit_app,
-            set_panel_height,
+            set_panel_size,
+            resize_panel,
             set_pin_popover,
-            set_update_available,
             set_global_shortcut,
-            open_release_page,
-            install_update,
             start_xiaomi_camera_bridge,
             bridge_hls_camera_stream,
             stop_xiaomi_camera_bridge
         ])
         .setup(move |app| {
-            sweep_stale_update_installers();
             if let Some(path) = authorization_store_path() {
                 if let Ok(mut guard) = EXTRA_ALLOWED_ORIGINS.write() {
                     *guard = read_origin_store(&path);
@@ -1549,7 +1071,7 @@ fn main() {
                 });
             }
 
-            let menu = build_tray_menu(app.handle(), Some("Alt+M"), None)?;
+            let menu = build_tray_menu(app.handle(), Some("Alt+M"))?;
 
             let mut tray_builder = TrayIconBuilder::with_id("main-tray")
                 .tooltip("MenuBarMijia · 菜单栏米家 (Alt+M)")
@@ -1557,19 +1079,6 @@ fn main() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "toggle" => toggle_main_window(app, None, false),
-                    "update" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            PIN_POPOVER.store(true, Ordering::SeqCst);
-                            position_popover(&window, None);
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                            let _ = window.eval(
-                                "window.dispatchEvent(new CustomEvent('menumijia:open-update'))",
-                            );
-                        } else if let Ok(url) = validated_release_url(RELEASE_PAGE_URL) {
-                            open_url_in_browser(&url);
-                        }
-                    }
                     "quit" => app.exit(0),
                     _ => {}
                 })
@@ -1600,16 +1109,275 @@ fn main() {
 mod tests {
     use super::*;
 
-    #[test]
-    fn sidecar_reserves_the_complete_expanded_footprint_at_each_scale() {
-        for scale in [1.0, 1.25, 1.5, 2.0] {
-            assert!(panel_sidecar_on_left(1178.0 * scale, 246.0 * scale, scale));
-            assert!(!panel_sidecar_on_left(1178.0 * scale, 252.0 * scale, scale));
-            assert!(panel_sidecar_on_left(244.0 * scale, 251.0 * scale, scale));
+    use ring::digest::{digest, SHA256};
+
+    use ring::signature::{UnparsedPublicKey, ED25519};
+
+    /// Offline Ed25519 public key (32-byte raw, base64) shared with `UpdateChecker.updateSigningPublicKeyBase64` (ADR-0005).
+    const UPDATE_SIGNING_PUBLIC_KEY_BASE64: &str = "rLwWXuP0sOZvgd/KusLTTmBXN9DAZ9EzPBNhFSn9yUo=";
+
+    /// Validates a GitHub release download URL for MenuBarMijia installer, `.sha256`, or `.ed25519.sig` sidecar assets.
+    fn validated_release_asset_url(raw: &str) -> Result<reqwest::Url, String> {
+        let url = reqwest::Url::parse(raw.trim()).map_err(|_| "更新包下载地址无效".to_string())?;
+        if url.scheme() != "https"
+            || url.port_or_known_default() != Some(443)
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err("更新包地址必须是无附加参数的 https://github.com 地址".to_string());
+        }
+        let host = url.host_str().map(normalize_host).unwrap_or_default();
+        if host != "github.com" {
+            return Err(format!("拒绝从非 GitHub 地址下载更新包：{host}"));
+        }
+        if !url
+            .path()
+            .starts_with("/jryang1997/MenuBarMijia/releases/download/")
+        {
+            return Err("拒绝下载非 MenuBarMijia 官方发布附件".to_string());
+        }
+        Ok(url)
+    }
+
+    fn release_asset_redirect_allowed(next: &reqwest::Url) -> bool {
+        if next.scheme() != "https"
+            || next.port_or_known_default() != Some(443)
+            || !next.username().is_empty()
+            || next.password().is_some()
+        {
+            return false;
+        }
+        let host = next.host_str().map(normalize_host).unwrap_or_default();
+        host == "github.com"
+            || host == "githubusercontent.com"
+            || host.ends_with(".githubusercontent.com")
+    }
+
+    fn parse_sha256_hex(raw: &str) -> Option<String> {
+        let token = raw.split_whitespace().next()?;
+        let candidate = token
+            .strip_prefix("sha256:")
+            .or_else(|| token.strip_prefix("SHA256:"))
+            .unwrap_or(token)
+            .to_ascii_lowercase();
+        if candidate.len() == 64 && candidate.chars().all(|c| c.is_ascii_hexdigit()) {
+            Some(candidate)
+        } else {
+            None
         }
     }
 
+    fn sanitize_installer_filename(raw: &str) -> Result<String, String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty()
+            || trimmed.contains('/')
+            || trimmed.contains('\\')
+            || trimmed.contains(':')
+            || trimmed.contains("..")
+            || trimmed.chars().any(|c| c.is_control())
+        {
+            return Err("更新安装包文件名无效".to_string());
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if !lower.ends_with(".exe") && !lower.ends_with(".msi") {
+            return Err("仅支持 .exe 或 .msi 安装包".to_string());
+        }
+        Ok(trimmed.to_string())
+    }
 
+    fn compute_sha256_hex(bytes: &[u8]) -> String {
+        let sum = digest(&SHA256, bytes);
+        let mut out = String::with_capacity(64);
+        for byte in sum.as_ref() {
+            use std::fmt::Write;
+            let _ = write!(&mut out, "{byte:02x}");
+        }
+        out
+    }
+
+    /// Decodes standard RFC 4648 base64 (ignoring surrounding whitespace).
+    fn decode_base64_strict(raw: &str) -> Option<Vec<u8>> {
+        let cleaned: Vec<u8> = raw
+            .bytes()
+            .filter(|b| !b.is_ascii_whitespace())
+            .collect();
+        if cleaned.is_empty() || cleaned.len() % 4 != 0 {
+            return None;
+        }
+        fn val(b: u8) -> Option<u8> {
+            match b {
+                b'A'..=b'Z' => Some(b - b'A'),
+                b'a'..=b'z' => Some(b - b'a' + 26),
+                b'0'..=b'9' => Some(b - b'0' + 52),
+                b'+' => Some(62),
+                b'/' => Some(63),
+                _ => None,
+            }
+        }
+        let mut out = Vec::with_capacity((cleaned.len() / 4) * 3);
+        for (idx, chunk) in cleaned.chunks_exact(4).enumerate() {
+            let is_last = idx + 1 == cleaned.len() / 4;
+            let a = val(chunk[0])?;
+            let b = val(chunk[1])?;
+            match (chunk[2], chunk[3]) {
+                (b'=', b'=') if is_last => {
+                    if (b & 0x0f) != 0 {
+                        return None;
+                    }
+                    out.push((a << 2) | (b >> 4));
+                }
+                (c_byte, b'=') if is_last => {
+                    let c = val(c_byte)?;
+                    if (c & 0x03) != 0 {
+                        return None;
+                    }
+                    out.push((a << 2) | (b >> 4));
+                    out.push((b << 4) | (c >> 2));
+                }
+                (b'=', _) | (_, b'=') => return None,
+                (c_byte, d_byte) => {
+                    let c = val(c_byte)?;
+                    let d = val(d_byte)?;
+                    out.push((a << 2) | (b >> 4));
+                    out.push((b << 4) | (c >> 2));
+                    out.push((c << 6) | d);
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// Verifies a detached Ed25519 signature over `data` against `public_key_base64` (ADR-0005).
+    fn verify_ed25519_signature(
+        signature_base64: &str,
+        public_key_base64: &str,
+        data: &[u8],
+    ) -> Result<(), String> {
+        let trimmed_sig = signature_base64.trim();
+        if trimmed_sig.is_empty() {
+            return Err("更新包缺少 Ed25519 数字签名（.ed25519.sig），已中止安装".to_string());
+        }
+        let key_bytes = decode_base64_strict(public_key_base64)
+            .filter(|bytes| bytes.len() == 32)
+            .ok_or_else(|| "内置 Ed25519 更新公钥无效".to_string())?;
+        let sig_bytes = decode_base64_strict(trimmed_sig)
+            .filter(|bytes| bytes.len() == 64)
+            .ok_or_else(|| "更新包 Ed25519 数字签名格式无效，已中止安装".to_string())?;
+        let public_key = UnparsedPublicKey::new(&ED25519, key_bytes);
+        public_key
+            .verify(data, &sig_bytes)
+            .map_err(|_| "更新包 Ed25519 数字签名校验失败：签名与安装包内容不匹配，已中止安装".to_string())
+    }
+
+    #[test]
+    fn validates_release_asset_urls_filenames_and_sha256() {
+        assert!(validated_release_asset_url(
+            "https://github.com/jryang1997/MenuBarMijia/releases/download/v1.1.4/MenuBarMijia-1.1.4-windows-x64-setup.exe"
+        )
+        .is_ok());
+        assert!(validated_release_asset_url(
+            "https://github.com/jryang1997/MenuBarMijia/releases/download/v1.1.4/MenuBarMijia-1.1.4-windows-x64-setup.exe.sha256"
+        )
+        .is_ok());
+
+        for bad in [
+            "http://github.com/jryang1997/MenuBarMijia/releases/download/v1.1.4/setup.exe",
+            "https://evil.example/jryang1997/MenuBarMijia/releases/download/v1.1.4/setup.exe",
+            "https://github.com/other/repo/releases/download/v1.1.4/setup.exe",
+            "https://github.com/jryang1997/MenuBarMijia/releases/tag/v1.1.4",
+            "https://github.com/jryang1997/MenuBarMijia/releases/download/v1.1.4/setup.exe?foo=1",
+        ] {
+            assert!(validated_release_asset_url(bad).is_err(), "{bad}");
+        }
+
+        assert!(release_asset_redirect_allowed(
+            &reqwest::Url::parse("https://objects.githubusercontent.com/github-production-release-asset/123").unwrap()
+        ));
+        assert!(!release_asset_redirect_allowed(
+            &reqwest::Url::parse("https://evil.example/setup.exe").unwrap()
+        ));
+        assert!(!release_asset_redirect_allowed(
+            &reqwest::Url::parse("http://objects.githubusercontent.com/setup.exe").unwrap()
+        ));
+
+        assert_eq!(
+            sanitize_installer_filename("MenuBarMijia-1.1.4-windows-x64-setup.exe").ok(),
+            Some("MenuBarMijia-1.1.4-windows-x64-setup.exe".to_string())
+        );
+        for bad_name in [
+            "../setup.exe",
+            "dir/setup.exe",
+            "dir\\setup.exe",
+            "C:setup.exe",
+            "payload.bat",
+            "",
+        ] {
+            assert!(sanitize_installer_filename(bad_name).is_err(), "{bad_name}");
+        }
+
+        let hex = compute_sha256_hex(b"verified-windows-installer");
+        assert_eq!(parse_sha256_hex(&format!("sha256:{}", hex.to_uppercase())), Some(hex.clone()));
+        assert_eq!(parse_sha256_hex(&format!("{hex}  MenuBarMijia-1.1.4-windows-x64-setup.exe\n")), Some(hex));
+        assert_eq!(parse_sha256_hex("sha256:1234"), None);
+
+        // Built-in Ed25519 public key decodes to 32 bytes (ADR-0005).
+        assert_eq!(
+            decode_base64_strict(UPDATE_SIGNING_PUBLIC_KEY_BASE64).map(|b| b.len()),
+            Some(32)
+        );
+        // Cross-platform CryptoKit Ed25519 signature over `b"verified-windows-installer"`.
+        let test_pub_b64 = "IVL40Zt5HSRFMkLhXy6rbLfP+ntqXtMAl5YOBpiB2xI=";
+        let test_sig_b64 =
+            "KtT4QT0xAahlehckpgTkX9/sMX/HypxQGInJ5/dR9Nl78X8bKzLcRNNLEzDGH6y+W3CRzkGiuf1qgIs6DCQDAQ==";
+        assert!(verify_ed25519_signature(
+            test_sig_b64,
+            test_pub_b64,
+            b"verified-windows-installer"
+        )
+        .is_ok());
+        assert!(verify_ed25519_signature(
+            test_sig_b64,
+            test_pub_b64,
+            b"tampered-windows-installer"
+        )
+        .is_err());
+        assert!(verify_ed25519_signature(
+            test_sig_b64,
+            UPDATE_SIGNING_PUBLIC_KEY_BASE64,
+            b"verified-windows-installer"
+        )
+        .is_err());
+        assert!(verify_ed25519_signature("", UPDATE_SIGNING_PUBLIC_KEY_BASE64, b"payload").is_err());
+        assert!(verify_ed25519_signature("not-base64!", UPDATE_SIGNING_PUBLIC_KEY_BASE64, b"payload").is_err());
+    }
+
+    #[test]
+    fn panel_fits_a_scaled_secondary_monitor_work_area() {
+        let (position, size) = panel_bounds(
+            PhysicalPosition::new(-1920, 40),
+            PhysicalSize::new(1920, 1040),
+            1.5,
+            (480.0, 620.0),
+            Some(PhysicalPosition::new(-40.0, 1100.0)),
+        );
+        assert_eq!(position, PhysicalPosition::new(-732, 138));
+        assert_eq!(size, PhysicalSize::new(720, 930));
+    }
+
+    #[test]
+    fn panel_temporarily_fits_smaller_work_areas() {
+        let desired = (720.0, 860.0);
+        let (_, fitted) = panel_bounds(
+            PhysicalPosition::new(0, 0), PhysicalSize::new(800, 560), 1.25, desired, None,
+        );
+        assert_eq!(fitted, PhysicalSize::new(780, 540));
+        let (_, restored) = panel_bounds(
+            PhysicalPosition::new(0, 0), PhysicalSize::new(1920, 1080), 1.0, desired, None,
+        );
+        assert_eq!(restored, PhysicalSize::new(720, 860));
+    }
 
     fn extra(origins: &[&str]) -> HashSet<String> {
         origins
@@ -1742,8 +1510,8 @@ mod tests {
     }
 
     #[test]
-    fn allows_the_public_github_release_api_only() {
-        assert!(allows(
+    fn blocks_retired_github_release_origin() {
+        assert!(!allows(
             "https://api.github.com/repos/jryang1997/MenuBarMijia/releases/latest",
             &[]
         ));
@@ -1752,20 +1520,6 @@ mod tests {
         assert!(!allows("https://api.github.com.evil.example/latest", &[]));
     }
 
-    #[test]
-    fn only_opens_menu_barmijia_release_pages() {
-        assert!(validated_release_url(RELEASE_PAGE_URL).is_ok());
-        assert!(validated_release_url(
-            "https://github.com/jryang1997/MenuBarMijia/releases/tag/v1.0.7"
-        )
-        .is_ok());
-
-        assert!(validated_release_url("http://github.com/jryang1997/MenuBarMijia/releases").is_err());
-        assert!(validated_release_url("https://evil.example/jryang1997/MenuBarMijia/releases").is_err());
-        assert!(validated_release_url("https://github.com/other/repo/releases").is_err());
-        assert!(validated_release_url("https://github.com/jryang1997/MenuBarMijia").is_err());
-        assert!(validated_release_url("javascript:alert(1)").is_err());
-    }
 
     #[test]
     fn frontend_cannot_grant_an_arbitrary_origin_and_then_request_it() {
@@ -1804,8 +1558,7 @@ mod tests {
                 error: tauri::ipc::CallbackFn(1),
                 url: invoke_url.clone(),
                 body: tauri::ipc::InvokeBody::Json(serde_json::json!({
-                    "assistantUrl": "https://evil.example",
-                    "haUrl": ""
+                    "haUrl": "https://evil.example"
                 })),
                 headers: Default::default(),
                 invoke_key: tauri::test::INVOKE_KEY.to_string(),
@@ -1948,90 +1701,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn validates_release_asset_urls_filenames_and_sha256() {
-        assert!(validated_release_asset_url(
-            "https://github.com/jryang1997/MenuBarMijia/releases/download/v1.1.4/MenuBarMijia-1.1.4-windows-x64-setup.exe"
-        )
-        .is_ok());
-        assert!(validated_release_asset_url(
-            "https://github.com/jryang1997/MenuBarMijia/releases/download/v1.1.4/MenuBarMijia-1.1.4-windows-x64-setup.exe.sha256"
-        )
-        .is_ok());
-
-        for bad in [
-            "http://github.com/jryang1997/MenuBarMijia/releases/download/v1.1.4/setup.exe",
-            "https://evil.example/jryang1997/MenuBarMijia/releases/download/v1.1.4/setup.exe",
-            "https://github.com/other/repo/releases/download/v1.1.4/setup.exe",
-            "https://github.com/jryang1997/MenuBarMijia/releases/tag/v1.1.4",
-            "https://github.com/jryang1997/MenuBarMijia/releases/download/v1.1.4/setup.exe?foo=1",
-        ] {
-            assert!(validated_release_asset_url(bad).is_err(), "{bad}");
-        }
-
-        assert!(release_asset_redirect_allowed(
-            &reqwest::Url::parse("https://objects.githubusercontent.com/github-production-release-asset/123").unwrap()
-        ));
-        assert!(!release_asset_redirect_allowed(
-            &reqwest::Url::parse("https://evil.example/setup.exe").unwrap()
-        ));
-        assert!(!release_asset_redirect_allowed(
-            &reqwest::Url::parse("http://objects.githubusercontent.com/setup.exe").unwrap()
-        ));
-
-        assert_eq!(
-            sanitize_installer_filename("MenuBarMijia-1.1.4-windows-x64-setup.exe").ok(),
-            Some("MenuBarMijia-1.1.4-windows-x64-setup.exe".to_string())
-        );
-        for bad_name in [
-            "../setup.exe",
-            "dir/setup.exe",
-            "dir\\setup.exe",
-            "C:setup.exe",
-            "payload.bat",
-            "",
-        ] {
-            assert!(sanitize_installer_filename(bad_name).is_err(), "{bad_name}");
-        }
-
-        let hex = compute_sha256_hex(b"verified-windows-installer");
-        assert_eq!(parse_sha256_hex(&format!("sha256:{}", hex.to_uppercase())), Some(hex.clone()));
-        assert_eq!(parse_sha256_hex(&format!("{hex}  MenuBarMijia-1.1.4-windows-x64-setup.exe\n")), Some(hex));
-        assert_eq!(parse_sha256_hex("sha256:1234"), None);
-
-        // Built-in Ed25519 public key decodes to 32 bytes (ADR-0005).
-        assert_eq!(
-            decode_base64_strict(UPDATE_SIGNING_PUBLIC_KEY_BASE64).map(|b| b.len()),
-            Some(32)
-        );
-        // Cross-platform CryptoKit Ed25519 signature over `b"verified-windows-installer"`.
-        let test_pub_b64 = "IVL40Zt5HSRFMkLhXy6rbLfP+ntqXtMAl5YOBpiB2xI=";
-        let test_sig_b64 =
-            "KtT4QT0xAahlehckpgTkX9/sMX/HypxQGInJ5/dR9Nl78X8bKzLcRNNLEzDGH6y+W3CRzkGiuf1qgIs6DCQDAQ==";
-        assert!(verify_ed25519_signature(
-            test_sig_b64,
-            test_pub_b64,
-            b"verified-windows-installer"
-        )
-        .is_ok());
-        assert!(verify_ed25519_signature(
-            test_sig_b64,
-            test_pub_b64,
-            b"tampered-windows-installer"
-        )
-        .is_err());
-        assert!(verify_ed25519_signature(
-            test_sig_b64,
-            UPDATE_SIGNING_PUBLIC_KEY_BASE64,
-            b"verified-windows-installer"
-        )
-        .is_err());
-        assert!(verify_ed25519_signature("", UPDATE_SIGNING_PUBLIC_KEY_BASE64, b"payload").is_err());
-        assert!(verify_ed25519_signature("not-base64!", UPDATE_SIGNING_PUBLIC_KEY_BASE64, b"payload").is_err());
-
-        assert!(elevated_launch_powershell_command(false).contains("-Verb RunAs"));
-        assert!(elevated_launch_powershell_command(false).contains("-ErrorAction Stop"));
-        assert!(elevated_launch_powershell_command(true).contains("msiexec.exe"));
-        assert!(elevated_launch_powershell_command(true).contains("-Verb RunAs"));
-    }
 }

@@ -5,8 +5,7 @@ import { defineConfig } from "vite";
 
 const configDir = fileURLToPath(new URL(".", import.meta.url));
 
-// The Windows package version is the repository's VERSION file; injecting it at build
-// time lets the update checker compare without a runtime Tauri call (#39).
+// Keep the version shown in Settings aligned with the package metadata.
 function appVersion(): string {
   try {
     const version = readFileSync(resolve(configDir, "../VERSION"), "utf8").trim();
@@ -39,5 +38,8 @@ export default defineConfig({
     target: "es2022",
     outDir: "dist",
     emptyOutDir: true,
+    rollupOptions: {
+      output: { manualChunks: { pinyin: ["pinyin-pro"] } },
+    },
   },
 });

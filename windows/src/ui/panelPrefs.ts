@@ -1,5 +1,5 @@
 import type { MiRoom } from "../core/miCloudClient.js";
-import type { SmartDevice } from "../core/models.js";
+import type { HomeBackend, SmartDevice } from "../core/models.js";
 import { t } from "../core/i18n.js";
 
 // Panel personalisation shared with the macOS app: skins, per-page card sizes, custom order,
@@ -61,6 +61,8 @@ export interface LayoutPrefs {
   /** `<page>|<sectionId>` of folded sections. */
   collapsed: string[];
   aliases: Record<string, string>;
+  hiddenDeviceIds: Partial<Record<HomeBackend | "demo", string[]>>;
+  hideOfflineDevices: boolean;
 }
 
 export const emptyLayoutPrefs = (): LayoutPrefs => ({
@@ -70,6 +72,8 @@ export const emptyLayoutPrefs = (): LayoutPrefs => ({
   groupMap: {},
   collapsed: [],
   aliases: {},
+  hiddenDeviceIds: {},
+  hideOfflineDevices: false,
 });
 
 export function scopedKey(page: string, id: string): string {

@@ -2,17 +2,17 @@
   color-scheme: dark;
   --glass-bg: rgba(28, 29, 36, 0.84);
   --glass-elevated: rgba(38, 40, 49, 0.92);
-  --tile-bg: rgba(255, 255, 255, 0.068);
-  --tile-hover: rgba(255, 255, 255, 0.098);
-  --tile-active-platter: rgba(255, 255, 255, 0.93);
+  --tile-bg: #343a47;
+  --tile-hover: #3e4655;
+  --tile-active-platter: #f5f7fb;
   --tile-active-ink: #1c1c1e;
-  --tile-active-muted: rgba(28, 28, 30, 0.58);
+  --tile-active-muted: #505969;
   --hairline: rgba(255, 255, 255, 0.1);
   --hairline-subtle: rgba(255, 255, 255, 0.065);
   --specular-top: rgba(255, 255, 255, 0.22);
   --text-primary: rgba(255, 255, 255, 0.96);
-  --text-secondary: rgba(235, 235, 245, 0.58);
-  --text-tertiary: rgba(235, 235, 245, 0.36);
+  --text-secondary: #c4cad5;
+  --text-tertiary: #a7b0c0;
 
   --apple-amber: #ff9500;
   --apple-blue: #007aff;
@@ -56,54 +56,49 @@ body {
 }
 
 #app {
-  --grok-rail-width: 84px;
   width: 100vw;
   height: 100vh;
   padding: 4px;
   display: grid;
-  grid-template-columns: minmax(0, 472px) var(--grok-rail-width);
-  grid-template-rows: minmax(0, 1fr);
-  column-gap: 12px;
-  justify-content: center;
+  grid-template: minmax(0, 1fr) / minmax(0, 1fr);
   background: transparent;
 }
-#app.is-grok-expanded { --grok-rail-width: 232px; }
-#app:not(.is-native-host) { --grok-rail-width: 232px; }
-#app > .cc-popover { grid-column: 1; grid-row: 1; min-width: 0; }
-#app > .cc-grok-sidebar { grid-column: 2; grid-row: 1; }
-#app[data-grok-side="left"] { grid-template-columns: var(--grok-rail-width) minmax(0, 472px); }
-#app[data-grok-side="left"] > .cc-popover { grid-column: 2; }
-#app[data-grok-side="left"] > .cc-grok-sidebar { grid-column: 1; flex-direction: row-reverse; }
 
 @media (min-width: 800px) {
   #app:not(.is-native-host) {
-    grid-template-columns: minmax(0, 424px) var(--grok-rail-width);
-    grid-template-rows: min(690px, calc(100vh - 40px));
-    align-content: center;
+    grid-template: min(690px, calc(100vh - 40px)) / minmax(0, 480px);
+    place-content: center;
     padding: 20px;
     background: #090a0f;
   }
-  #app:not(.is-native-host)[data-grok-side="left"] {
-    grid-template-columns: var(--grok-rail-width) minmax(0, 424px);
-  }
 }
 
-@media (max-width: 627px) {
-  #app.is-grok-expanded { --grok-rail-width: 148px; }
-  #app:not(.is-native-host) { --grok-rail-width: 148px; }
-  #app:not(.is-native-host) > .cc-grok-sidebar { flex-direction: column; }
-  #app.is-grok-expanded > .cc-grok-sidebar { flex-direction: column; }
+.cc-panel-resize {
+  position: absolute;
+  z-index: 10;
+  top: 1px;
+  left: 1px;
+  width: 20px;
+  height: 20px;
+  cursor: nwse-resize;
+  touch-action: none;
+}
+
+.cc-panel-resize::after {
+  content: "";
+  position: absolute;
+  inset: 4px;
+  border-top: 1px solid var(--text-secondary);
+  border-left: 1px solid var(--text-secondary);
+  border-top-left-radius: 9px;
+  opacity: 0.9;
 }
 
 .cc-popover {
   width: 100%;
   height: 100%;
   border-radius: 22px;
-  background:
-    radial-gradient(120% 70% at 0% 0%, rgba(255, 255, 255, 0.055), transparent 55%),
-    linear-gradient(180deg, rgba(40, 42, 52, 0.84) 0%, rgba(24, 25, 32, 0.90) 100%);
-  backdrop-filter: blur(54px) saturate(200%);
-  -webkit-backdrop-filter: blur(54px) saturate(200%);
+  background: linear-gradient(165deg, #292e3a 0%, #1c202a 100%);
   border: 0.5px solid rgba(255, 255, 255, 0.14);
   box-shadow:
     inset 0 1px 0 var(--specular-top),
@@ -154,61 +149,6 @@ body {
   flex-shrink: 0;
 }
 .cc-home-emblem svg { width: 15px; height: 15px; }
-.cc-grok-sidebar {
-  width: var(--grok-rail-width);
-  margin-top: 44px;
-  display: flex;
-  align-items: flex-start;
-  align-self: start;
-  gap: 12px;
-  min-height: 84px;
-}
-.cc-grok-toggle {
-  width: 72px;
-  height: 72px;
-  margin-top: 6px;
-  flex-shrink: 0;
-  border: 0;
-  background: transparent;
-  cursor: pointer;
-}
-.cc-grok-toggle:focus-visible,
-.cc-grok-pill:focus-visible { outline: 2px solid var(--apple-blue); outline-offset: 3px; }
-.cc-grok-ball, [data-grok-slot] { display: block; width: 100%; height: 100%; }
-.cc-grok-stage { display: flex; flex-direction: column; gap: 8px; width: 148px; flex-shrink: 0; }
-.cc-grok-pill {
-  width: 148px;
-  height: 44px;
-  padding: 8px 12px;
-  border: 1px solid var(--hairline);
-  border-radius: 16px;
-  background: var(--glass-elevated);
-  color: var(--text-primary);
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
-  font: inherit;
-  font-size: 11px;
-  line-height: 1.35;
-  text-align: left;
-  overflow-wrap: anywhere;
-  overflow: hidden;
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-  cursor: pointer;
-  transition: transform 200ms var(--ease-spring), opacity 180ms var(--ease-out-quart), background 160ms var(--ease-out-quart);
-}
-@starting-style {
-  .cc-grok-pill { opacity: 0; transform: translateX(-12px); }
-  #app[data-grok-side="left"] .cc-grok-pill { transform: translateX(12px); }
-}
-@media (hover: hover) and (pointer: fine) {
-  .cc-grok-pill:hover { background: var(--tile-hover); }
-}
-@media (prefers-reduced-motion: reduce) {
-  .cc-grok-pill { transition: opacity 160ms var(--ease-out-quart); }
-  @starting-style { .cc-grok-pill { transform: none !important; } }
-}
-
 .cc-title-stack {
   display: flex;
   flex-direction: column;
@@ -442,9 +382,9 @@ body {
 }
 
 /* =========================================================================
-   Spotlight Assistant Command Bar
+   Device Search and Control Feedback
    ========================================================================= */
-.cc-assistant-section {
+.cc-search-section {
   padding: 3px 15px 6px;
   display: flex;
   flex-direction: column;
@@ -501,33 +441,6 @@ body {
 
 .cc-spotlight-input::placeholder {
   color: var(--text-tertiary);
-}
-
-.cc-spotlight-send {
-  width: 24px;
-  height: 24px;
-  border: none;
-  background: transparent;
-  color: var(--apple-blue);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  opacity: 0.88;
-  transition: transform 150ms var(--ease-spring), opacity 150ms ease;
-}
-
-.cc-spotlight-send:hover {
-  opacity: 1;
-}
-
-.cc-spotlight-send svg {
-  width: 18px;
-  height: 18px;
-}
-
-.cc-spotlight-send:active {
-  transform: scale(0.9);
 }
 
 .cc-feedback-card {
@@ -594,13 +507,6 @@ body {
 
 .cc-inline-pill:active {
   transform: scale(0.95);
-}
-
-.cc-suggestion-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 5px;
-  margin-top: 2px;
 }
 
 .cc-timers-stack {
@@ -826,7 +732,7 @@ body {
 }
 
 .cc-tile.is-offline {
-  opacity: 0.48;
+  opacity: 0.78;
 }
 
 /* Authentic Apple HomeKit / Control Center Luminous Pearl Active Platter */
@@ -2542,22 +2448,20 @@ input[type="checkbox"]:checked::after {
   color-scheme: light;
   --glass-bg: rgba(245, 247, 252, 0.86);
   --glass-elevated: rgba(255, 255, 255, 0.95);
-  --tile-bg: rgba(255, 255, 255, 0.56);
-  --tile-hover: rgba(255, 255, 255, 0.78);
+  --tile-bg: #f7f9fc;
+  --tile-hover: #ffffff;
   --tile-active-platter: #ffffff;
   --tile-active-ink: #1c1c1e;
-  --tile-active-muted: rgba(28, 28, 30, 0.58);
+  --tile-active-muted: #505969;
   --hairline: rgba(0, 0, 0, 0.075);
   --hairline-subtle: rgba(0, 0, 0, 0.055);
   --specular-top: rgba(255, 255, 255, 0.95);
   --text-primary: #1c1c1e;
-  --text-secondary: rgba(60, 60, 67, 0.66);
-  --text-tertiary: rgba(60, 60, 67, 0.44);
+  --text-secondary: #414c5d;
+  --text-tertiary: #566274;
 
   color: var(--text-primary);
-  background:
-    radial-gradient(120% 70% at 0% 0%, rgba(255, 255, 255, 0.85), transparent 55%),
-    linear-gradient(180deg, rgba(248, 250, 254, 0.88) 0%, rgba(235, 239, 247, 0.92) 100%);
+  background: linear-gradient(165deg, #f7f9fc 0%, #e5eaf2 100%);
   border: 0.5px solid rgba(0, 0, 0, 0.1);
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.95),
@@ -2573,7 +2477,7 @@ input[type="checkbox"]:checked::after {
 
 .cc-popover.scheme-light .cc-mode-pill.is-cloud {
   background: rgba(48, 209, 88, 0.16);
-  color: #1d9a40;
+  color: #166c36;
 }
 
 .cc-popover.scheme-light .cc-circle-btn {
@@ -2614,7 +2518,7 @@ input[type="checkbox"]:checked::after {
 
 .cc-popover.scheme-light .cc-env-chip.is-power,
 .cc-popover.scheme-light .cc-env-chip.is-power .cc-env-val {
-  color: #d97706;
+  color: #995009;
 }
 
 .cc-popover.scheme-light .cc-spotlight-bar {
@@ -2643,6 +2547,16 @@ input[type="checkbox"]:checked::after {
 .cc-popover.scheme-light .cc-feedback-badge {
   background: rgba(0, 122, 255, 0.12);
   color: #0062cc;
+}
+
+.cc-popover.scheme-light .cc-feedback-card.is-error {
+  background: #fff0ef;
+  border-color: #e1aaa7;
+}
+
+.cc-popover.scheme-light .cc-feedback-card.is-error .cc-feedback-badge {
+  background: #f8d8d6;
+  color: #9c2823;
 }
 
 .cc-popover.scheme-light .cc-inline-pill {
@@ -2778,7 +2692,7 @@ input[type="checkbox"]:checked::after {
 }
 
 .cc-popover.scheme-light .cc-sensor-hum {
-  color: #0284c7;
+  color: #075985;
 }
 
 .cc-popover.scheme-light .cc-comfort.is-comfy {

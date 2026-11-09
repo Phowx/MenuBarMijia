@@ -14,6 +14,21 @@ export type LanguagePreference = "system" | AppLanguage;
 
 /** Chinese key → [Simplified Chinese, English]. */
 const CATALOG: Readonly<Record<string, readonly [string, string]>> = {
+  "搜索设备或房间": ["搜索设备或房间", "Search devices or rooms"],
+  "搜索设备或房间 (Ctrl+F)": ["搜索设备或房间 (Ctrl+F)", "Search devices or rooms (Ctrl+F)"],
+  "隐藏此设备": ["隐藏此设备", "Hide device"],
+  "隐藏离线设备": ["隐藏离线设备", "Hide offline devices"],
+  "已隐藏的设备 ({count})": ["已隐藏的设备 ({count})", "Hidden devices ({count})"],
+  "恢复显示": ["恢复显示", "Unhide"],
+  "当前没有可显示的设备": ["当前没有可显示的设备", "No visible devices"],
+  "找不到匹配的设备": ["找不到匹配的设备", "No matching devices"],
+  "当前房间没有可执行此操作的设备": ["当前房间没有可执行此操作的设备", "No devices in this room support this action"],
+  "Windows 自用版": ["Windows 自用版", "Windows personal edition"],
+  "面板大小": ["面板大小", "Panel size"],
+  "拖动左上角调整面板大小": ["拖动左上角调整面板大小", "Drag the top-left corner to resize"],
+  "恢复默认尺寸": ["恢复默认尺寸", "Restore default size"],
+  "快捷动作": ["快捷动作", "Quick action"],
+  "场景": ["场景", "Scene"],
   // Chrome
   "切换家庭": ["切换家庭", "Switch home"],
   "演示预览": ["演示预览", "Demo preview"],
