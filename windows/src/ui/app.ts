@@ -1,31 +1,7 @@
 import { HomeAssistantClient, homeAssistantIdentity, homeAssistantCommand, parseCachedHAHome } from "../core/homeAssistant.js";
+import { pinyin } from "pinyin-pro";
 import type { SynthesizedHome } from "../core/models.js";
-import { GrokBallView } from "./grokBall.js";
-import {
-  ASSISTANT_PROVIDER_PRESETS,
-  DelayPhrase,
-  IntentReply,
-  IntentValidator,
-  LocalIntentParser,
-  ModelIntentResolver,
-  UndoPhrase,
-  UserHabitMemory,
-  buildAssistantContext,
-  buildHabitSummary,
-  habitActionable,
-  inferAssistantPreset,
-  assistantEndpointIdentity,
-  endpointAllowsSendingSecrets,
-  isLocalAssistantEndpoint,
-  timeBucketLabel,
-  INSECURE_ENDPOINT_MESSAGE,
-  ModelActionPolicy,
-  resolveGrokBallEmotion,
-  type HabitEntry,
-  type HabitLastAction,
-  type HabitRecordingReceipt,
-  type HabitSequenceEntry,
-} from "../core/assistant.js";
+import { IntentReply, IntentValidator } from "../core/assistant.js";
 import {
   type HttpRequest,
   type HttpResponse,
@@ -45,17 +21,6 @@ import {
   normalizeMiCloudRegion,
 } from "../core/miCloudClient.js";
 import {
-  UPDATE_RELEASES_PAGE,
-  UPDATE_RELEASES_URL,
-  UPDATE_STORAGE_KEY,
-  checkForUpdate,
-  isNewerVersion,
-  parseUpdateState,
-  serializeUpdateState,
-  type GitHubRelease,
-  type UpdateState,
-} from "../core/updateChecker.js";
-import {
   CredentialVault,
   credentialsFromSettings,
   hasCredentials,
@@ -64,13 +29,11 @@ import {
   sessionWithoutPassToken,
 } from "../core/secureStore.js";
 import {
-  type AssistantSuggestion,
   type DeviceCommand,
   type DeviceIntent,
+  type IntentOperation,
   type EnvironmentReading,
   type HomeScene,
-  type IntentPlan,
-  type ScheduledCommand,
   type SmartDevice,
   allOffTargets,
   cloudRefreshDue,
@@ -83,7 +46,6 @@ import {
   localizeNightShot,
   localizeAirQuality,
   localizeFanPreset,
-  partitionDueTimers,
 } from "../core/models.js";
 import {
   type AppAppearance,
@@ -123,7 +85,6 @@ import {
   type LanguagePreference,
   resolveLanguage,
   setLanguage,
-  speechLocale,
   t,
 } from "../core/i18n.js";
 import {
@@ -143,66 +104,22 @@ declare global {
     __TAURI_INTERNALS__?: {
       invoke: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
     };
-    webkitSpeechRecognition?: new () => SpeechRecognitionInstance;
-    SpeechRecognition?: new () => SpeechRecognitionInstance;
   }
 }
 
-interface SpeechRecognitionAlternative {
-  readonly transcript: string;
-}
-
-interface SpeechRecognitionResultItem {
-  readonly isFinal: boolean;
-  readonly 0: SpeechRecognitionAlternative;
-}
-
-interface SpeechRecognitionEventLike {
-  readonly results: ArrayLike<SpeechRecognitionResultItem>;
-}
-
-interface SpeechRecognitionInstance {
-  lang: string;
-  interimResults: boolean;
-  continuous: boolean;
-  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
-  onerror: ((event: { error: string }) => void) | null;
-  onend: (() => void) | null;
-  start(): void;
-  stop(): void;
-}
-
 type ConnectionMode = "demo" | "xiaomiCloud" | "homeAssistant";
-
-interface LearnedShortcut {
-  readonly phrase: string;
-  readonly reply: string;
-  readonly intents: readonly DeviceIntent[];
-  readonly learnedAt: string;
-}
 
 interface PersistedSettings {
   connectionMode: ConnectionMode;
   miSession: MiSession | null;
   /** Non-sensitive Xiaomi cloud region for the next QR login (#37); the session keeps the region it logged in with. */
   miCloudRegion: string;
-  /** Daily GitHub release check (#39); off means no request at all. */
-  autoCheckUpdates: boolean;
   haBaseURL: string;
   haToken: string;
-  assistantBaseURL: string;
+  // Retain the existing credential vault entry on upgrade.
   openRouterApiKey: string;
-  /** host[:port] the API key was saved for; the key is never sent to another server (#19). */
-  assistantKeyEndpoint: string | null;
-  /** Cloud AI services (host[:port]) the user allowed to receive commands; asked once per service (#20). */
-  cloudConsentEndpoints: string[];
   /** Per-device choice for 全关; missing means the default (plugs and vacuums stay out) (#23). */
   allOffOverrides: Record<string, boolean>;
-  assistantModel: string;
-  habitLearningEnabled: boolean;
-  learnedShortcuts: LearnedShortcut[];
-  /** Time-bucket habit entries learned from manual card actions and local commands (#113). */
-  habitEntries: HabitEntry[];
   hasCompletedOnboarding: boolean;
   isCompactGridMode: boolean;
   cachedXiaomiDevices: SmartDevice[];
@@ -211,6 +128,7 @@ interface PersistedSettings {
   skin: AppSkin;
   appearance: AppAppearance;
   panelHeight: PanelHeight;
+  panelSize: { width: number; height: number } | null;
   climatePanel: boolean;
   layout: LayoutPrefs;
   /** Selected Mi Home id; null shows every home. */
@@ -236,20 +154,29 @@ interface UndoAction {
   readonly summary: string;
   readonly steps: readonly UndoStep[];
   readonly expiresAtMs: number;
-  /** Habit records written while executing; undoing takes them back (#113). */
-  readonly habitReceipt?: HabitRecordingReceipt;
 }
 
 interface ReplyBannerState {
   readonly text: string;
   readonly source: string;
   readonly isError?: boolean;
+  readonly isCloudSyncError?: boolean;
 }
 
 const STORAGE_KEY = "menumijia.windows.settings.v2";
 // The #52 language/unit preferences live inside the one settings blob above, so a save writes them
 // atomically with the rest; `i18n.ts` and `temperature.ts` expose matching standalone keys for tools.
 const LEGACY_STORAGE_KEY = "menumijia.windows.settings.v1";
+const DEFAULT_PANEL_SIZE = { width: 480, height: 620 };
+const MIN_PANEL_SIZE = { width: 360, height: 380 };
+
+function storedPanelSize(size: unknown): PersistedSettings["panelSize"] {
+  if (!size || typeof size !== "object" || !("width" in size) || !("height" in size)) return null;
+  const { width, height } = size;
+  return typeof width === "number" && Number.isFinite(width) && width >= MIN_PANEL_SIZE.width &&
+    typeof height === "number" && Number.isFinite(height) && height >= MIN_PANEL_SIZE.height
+    ? { width, height } : null;
+}
 
 // Injected at build time by vite.config.ts from the repository's VERSION file (#39).
 const APP_VERSION =
@@ -264,7 +191,7 @@ const SF_ICONS = {
   powerplugFill: `<svg viewBox="0 0 20 20" fill="currentColor"><path d="M7 2a1 1 0 011 1v3h4V3a1 1 0 112 0v3h1a1 1 0 011 1v2.5a5.5 5.5 0 01-4.5 5.408V17a1 1 0 11-2 0v-2.092A5.5 5.5 0 014 9.5V7a1 1 0 011-1h1V3a1 1 0 011-1z"/></svg>`,
   sparkles: `<svg viewBox="0 0 20 20" fill="currentColor"><path d="M10.8 2.4a.6.6 0 00-1.1 0L8.1 6.3a2.2 2.2 0 01-1.2 1.2L3 9.1a.6.6 0 000 1.1l3.9 1.6c.5.2 1 .7 1.2 1.2l1.6 3.9a.6.6 0 001.1 0l1.6-3.9c.2-.5.7-1 1.2-1.2l3.9-1.6a.6.6 0 000-1.1l-3.9-1.6a2.2 2.2 0 01-1.2-1.2L10.8 2.4zM15.8 13.2a.4.4 0 00-.7 0l-.6 1.4-.4.4-1.4.6a.4.4 0 000 .7l1.4.6.4.4.6 1.4a.4.4 0 00.7 0l.6-1.4.4-.4 1.4-.6a.4.4 0 000-.7l-1.4-.6-.4-.4-.6-1.4z"/></svg>`,
   sensorFill: `<svg viewBox="0 0 20 20" fill="currentColor"><path d="M10 3a2.5 2.5 0 00-2.5 2.5v6.085a4 4 0 105 0V5.5A2.5 2.5 0 0010 3zm0 1.5a1 1 0 011 1v6.6a.75.75 0 00.32.614 2.5 2.5 0 11-2.64 0 .75.75 0 00.32-.614V5.5a1 1 0 011-1z"/></svg>`,
-  micFill: `<svg viewBox="0 0 20 20" fill="currentColor"><path d="M10 2.5a2.75 2.75 0 00-2.75 2.75v4.5a2.75 2.75 0 005.5 0v-4.5A2.75 2.75 0 0010 2.5zM5.25 9.25a.75.75 0 00-1.5 0 6.25 6.25 0 005.5 6.205V17.5h-2a.75.75 0 000 1.5h5.5a.75.75 0 000-1.5h-2v-2.045a6.25 6.25 0 005.5-6.205.75.75 0 00-1.5 0 4.75 4.75 0 11-9.5 0z"/></svg>`,
+  search: `<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="8.5" cy="8.5" r="5.5"/><path d="m13 13 4 4" stroke-linecap="round"/></svg>`,
   arrowClockwise: `<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M16.5 4.5v4h-4"/><path d="M15.8 12.8a6.2 6.2 0 11-1.3-6.6L16.5 8.5"/></svg>`,
   sliderHorizontal: `<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M3 5.5h9M15 5.5h2M3 10h3M9 10h8M3 14.5h7M13 14.5h4"/><circle cx="13.5" cy="5.5" r="1.6" fill="currentColor"/><circle cx="7.5" cy="10" r="1.6" fill="currentColor"/><circle cx="11.5" cy="14.5" r="1.6" fill="currentColor"/></svg>`,
   power: `<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round"><path d="M10 2.8v6.4M6.1 4.8a6.2 6.2 0 107.8 0"/></svg>`,
@@ -277,7 +204,6 @@ const SF_ICONS = {
   grid1x2: `<svg viewBox="0 0 20 20" fill="currentColor"><rect x="3" y="3.5" width="14" height="5.2" rx="1.6"/><rect x="3" y="11.3" width="14" height="5.2" rx="1.6"/></svg>`,
   qrcode: `<svg viewBox="0 0 20 20" fill="currentColor"><path d="M3 3h6v6H3V3zm1.5 1.5v3h3v-3h-3zM11 3h6v6h-6V3zm1.5 1.5v3h3v-3h-3zM3 11h6v6H3v-6zm1.5 1.5v3h3v-3h-3zM11 11h2.5v2.5H11V11zm3.5 0H17v2.5h-2.5V11zM11 14.5h2.5V17H11v-2.5zm3.5 0H17V17h-2.5v-2.5z"/></svg>`,
   xmark: `<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M5.5 5.5l9 9M14.5 5.5l-9 9"/></svg>`,
-  arrowUpCircle: `<svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" clip-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm.53-11.28a.75.75 0 00-1.06 0L6.72 9.47a.75.75 0 101.06 1.06l1.47-1.47v4.19a.75.75 0 001.5 0V9.06l1.47 1.47a.75.75 0 101.06-1.06l-2.75-2.75z"/></svg>`,
   videoFill: `<svg viewBox="0 0 20 20" fill="currentColor"><path d="M3 5a2 2 0 012-2h7a2 2 0 012 2v1.8l3.1-1.85A.75.75 0 0118.25 5.6v8.8a.75.75 0 01-1.15.65L14 13.2V15a2 2 0 01-2 2H5a2 2 0 01-2-2V5z"/></svg>`,
 };
 
@@ -443,13 +369,14 @@ function quickActions(): ReadonlyArray<{
   readonly title: string;
   readonly icon: string;
   readonly tint: string;
-  readonly command: string;
+  readonly deviceKind: "light" | "climate";
+  readonly operations: readonly IntentOperation[];
 }> {
   return [
-    { id: "lights_on", title: t(t("全开主灯")), icon: SF_ICONS.sunMaxFill, tint: "amber", command: t(t("打开所有灯")) },
-    { id: "lights_off", title: t(t("睡眠关灯")), icon: SF_ICONS.moonStarsFill, tint: "indigo", command: t(t("关闭所有灯")) },
-    { id: "cool_25", title: t(t("25°制冷")), icon: SF_ICONS.snowflake, tint: "cyan", command: t(t("空调调到25度")) },
-    { id: "focus", title: t(t("调亮灯光")), icon: SF_ICONS.lightbulbFill, tint: "amber", command: t(t("再亮一点")) },
+    { id: "lights_on", title: t("全开主灯"), icon: SF_ICONS.sunMaxFill, tint: "amber", deviceKind: "light", operations: [{ kind: "power", isOn: true }] },
+    { id: "lights_off", title: t("睡眠关灯"), icon: SF_ICONS.moonStarsFill, tint: "indigo", deviceKind: "light", operations: [{ kind: "power", isOn: false }] },
+    { id: "cool_25", title: t("25°制冷"), icon: SF_ICONS.snowflake, tint: "cyan", deviceKind: "climate", operations: [{ kind: "hvacMode", mode: "cool" }, { kind: "targetTemperature", celsius: 25 }] },
+    { id: "focus", title: t("调亮灯光"), icon: SF_ICONS.lightbulbFill, tint: "amber", deviceKind: "light", operations: [{ kind: "brightnessStep", delta: 20 }] },
   ];
 }
 
@@ -538,39 +465,15 @@ function loadSettings(): LoadedSettings {
           connectionMode: mode,
           miSession,
           miCloudRegion: normalizeMiCloudRegion(parsed.miCloudRegion ?? miSession?.region),
-          autoCheckUpdates: parsed.autoCheckUpdates ?? true,
           haBaseURL: parsed.haBaseURL ?? "",
           haToken: rawHaToken,
-          assistantBaseURL: parsed.assistantBaseURL ?? "https://openrouter.ai/api/v1",
           openRouterApiKey: rawApiKey,
-          // Keys saved before binding existed belong to the URL saved alongside them.
-          assistantKeyEndpoint:
-            parsed.assistantKeyEndpoint !== undefined
-              ? parsed.assistantKeyEndpoint
-              : parsed.openRouterApiKey
-                ? assistantEndpointIdentity(parsed.assistantBaseURL ?? "https://openrouter.ai/api/v1")
-                : null,
-          cloudConsentEndpoints: Array.isArray(parsed.cloudConsentEndpoints)
-            ? parsed.cloudConsentEndpoints.filter((e): e is string => typeof e === "string")
-            : [],
           allOffOverrides:
             parsed.allOffOverrides && typeof parsed.allOffOverrides === "object"
               ? Object.fromEntries(
                   Object.entries(parsed.allOffOverrides).filter((entry): entry is [string, boolean] => typeof entry[1] === "boolean"),
                 )
               : {},
-          assistantModel: parsed.assistantModel ?? "~typesafe/jev-latest",
-          habitLearningEnabled: parsed.habitLearningEnabled ?? true,
-          learnedShortcuts: parsed.learnedShortcuts ?? [],
-          habitEntries: Array.isArray(parsed.habitEntries)
-            ? parsed.habitEntries.filter(
-                (e): e is HabitEntry =>
-                  typeof e?.bucket === "string" &&
-                  typeof e?.targetId === "string" &&
-                  typeof e?.operationKey === "string" &&
-                  typeof e?.count === "number",
-              )
-            : [],
           hasCompletedOnboarding: parsed.hasCompletedOnboarding ?? Boolean(miSession),
           isCompactGridMode: parsed.isCompactGridMode ?? true,
           cachedXiaomiDevices: Array.isArray(parsed.cachedXiaomiDevices)
@@ -587,6 +490,7 @@ function loadSettings(): LoadedSettings {
               ? parsed.appearance
               : "system",
           panelHeight: PANEL_HEIGHTS.some((h) => h.id === parsed.panelHeight) ? (parsed.panelHeight as PanelHeight) : "standard",
+          panelSize: storedPanelSize(parsed.panelSize),
           climatePanel: parsed.climatePanel ?? true,
           interfaceLanguage:
             parsed.interfaceLanguage === "zh-Hans" || parsed.interfaceLanguage === "en"
@@ -620,18 +524,10 @@ function loadSettings(): LoadedSettings {
       connectionMode: "demo",
       miSession: null,
       miCloudRegion: "cn",
-      autoCheckUpdates: true,
       haBaseURL: "",
       haToken: "",
-      assistantBaseURL: "https://openrouter.ai/api/v1",
       openRouterApiKey: "",
-      assistantKeyEndpoint: null,
-      cloudConsentEndpoints: [],
       allOffOverrides: {},
-      assistantModel: "~typesafe/jev-latest",
-      habitLearningEnabled: true,
-      learnedShortcuts: [],
-      habitEntries: [],
       hasCompletedOnboarding: false,
       isCompactGridMode: true,
       cachedXiaomiDevices: [],
@@ -640,6 +536,7 @@ function loadSettings(): LoadedSettings {
       skin: "classic",
       appearance: "system",
       panelHeight: "standard",
+      panelSize: null,
       climatePanel: true,
       layout: emptyLayoutPrefs(),
       selectedHomeId: null,
@@ -742,30 +639,24 @@ export class MenuMijiaWindowsApp {
   private environmentReadings: EnvironmentReading[] = [];
   private selectedRoom = "全部";
   private expandedDeviceId: string | null = null;
-  private isShowingAssistantBar = true;
+  private deviceSearch = "";
+  private isDeviceSearchOpen = false;
   private activeSheet: "none" | "onboarding" | "settings" = "none";
   private onboardingStep = 0;
   private replyBanner: ReplyBannerState | null = null;
   private haConnectionError: string | null = null;
   /** A command waiting for the user to allow sending it to a cloud AI service (#20). */
-  private pendingCloudConsent: { utterance: string; endpoint: string } | null = null;
-  /** AI guesses that wait for a tap instead of running by themselves (#21). */
-  private pendingSuggestions: AssistantSuggestion[] = [];
-  /** AI-ranked proactive suggestions for the current ambient signature (#113). */
-  private aiProactiveSuggestions: AssistantSuggestion[] | null = null;
-  private aiProactiveSignature: string | null = null;
-  private isRefreshingProactive = false;
-  private isGrokBallStageExpanded = false;
-  private readonly grokBall = new GrokBallView();
-  private grokBallCelebrationUntil = 0;
-  private grokBallPointerUntil = 0;
-  private grokBallOnLeft = false;
-  private panelGeometryUpdates: Promise<void> = Promise.resolve();
-  /** Earliest timestamp a failed background refresh may retry (Codex #116 review). */
-  private proactiveRetryAfterMs: number | null = null;
-  /** Cooldown before a failed background refresh retries (Codex #116 review). */
-  private static readonly PROACTIVE_RETRY_COOLDOWN_MS = 5 * 60_000;
-  private isResolvingIntent = false;
+  private panelResize: {
+    pointerId: number;
+    startX: number;
+    startY: number;
+    startWidth: number;
+    startHeight: number;
+    width: number;
+    height: number;
+    moved: boolean;
+  } | null = null;
+  private resizeFrame: number | undefined;
   private isSyncingCloud = false;
   private syncGeneration = 0;
   private lastCloudRefreshAt: number | null = null;
@@ -775,16 +666,11 @@ export class MenuMijiaWindowsApp {
   private pendingCloudRender = false;
   private endpointSubmission: Promise<unknown> = Promise.resolve();
   private pointerIsDown = false;
-  private isListeningVoice = false;
-  private scheduledCommands: ScheduledCommand[] = [];
-  /** Timers that came due while the PC slept; they only run when the user taps 立即执行 (#22). */
-  private missedScheduledCommands: ScheduledCommand[] = [];
   private lastUndoAction: UndoAction | null = null;
   private qrTicket: QRLoginTicket | null = null;
   private qrStatusText = t("点击下方按钮获取安全二维码，用手机「米家 App → 扫一扫」即可同步真实全屋设备。");
   private isPollingQR = false;
   /** Latest GitHub release found by the daily check (#39); shown in settings and the tray menu. */
-  private availableUpdate: GitHubRelease | null = null;
   private activeLiveCameraId: string | null = null;
   /**
    * The camera frees a used P2P session on its own schedule (measured: a fresh
@@ -808,13 +694,8 @@ export class MenuMijiaWindowsApp {
   private liveCameraImgEl: HTMLImageElement | null = null;
   private liveCameraToken = 0;
   private readonly pendingCameraReleases = new Map<string, Promise<void>>();
-  private updateState: UpdateState = { lastCheckedAtMs: null, release: null };
-  private isCheckingUpdate = false;
-  private isInstallingUpdate = false;
-  private updateStatusMessage: { text: string; isError: boolean } | null = null;
   private readonly transport: HttpTransport = createTransport();
   private readonly specResolver: MiotSpecResolver;
-  private speechRecognition: SpeechRecognitionInstance | null = null;
 
   // Personalisation / layout editing state (see panelPrefs.ts).
   private homes: HomeOption[] = [];
@@ -856,29 +737,18 @@ export class MenuMijiaWindowsApp {
     }
 
     this.bindGlobalKeys();
-    window.addEventListener("pointermove", (event) => {
-      const rect = this.grokBall.element.getBoundingClientRect();
-      this.grokBallPointerUntil = Date.now() + 1500;
-      this.grokBall.setGaze((event.clientX - rect.left - rect.width / 2) / 160,
-        (event.clientY - rect.top - rect.height / 2) / 160);
-      this.syncGrokBallEmotion();
-    });
     this.bindLayoutGestures();
     this.bindOpenAnimation();
-    window.addEventListener("menumijia:open-update", () => {
-      this.openSettingsSheet();
-    });
-    this.applyPanelHeight();
+    this.bindPanelResize();
+    this.applyPanelSize();
     void this.applyGlobalHotkey();
     this.startTimerLoop();
-    this.restoreUpdateState();
     this.render();
 
     if (this.settings.connectionMode === "xiaomiCloud" && this.settings.miSession) {
       void this.refreshDevices();
     }
-    // At most one GitHub request per local day, and only inside the packaged app (#39).
-    void this.checkForAppUpdate(false);
+
   }
 
   /**
@@ -909,7 +779,6 @@ export class MenuMijiaWindowsApp {
       if (current.haToken === "" && credentials.haToken !== "") this.settings.haToken = credentials.haToken;
       if (current.assistantApiKey === "" && credentials.assistantApiKey !== "") {
         this.settings.openRouterApiKey = credentials.assistantApiKey;
-        this.settings.assistantKeyEndpoint ??= assistantEndpointIdentity(this.settings.assistantBaseURL);
       }
       if (this.settings.miSession) {
         this.settings.hasCompletedOnboarding = true;
@@ -972,148 +841,20 @@ export class MenuMijiaWindowsApp {
   }
 
   private submitServiceEndpoints(force = false): void {
-    const assistantUrl = this.settings.assistantBaseURL.trim();
     const haUrl = this.settings.haBaseURL.trim();
-    const serialized = `${assistantUrl}\n${haUrl}`;
-    if (!force && serialized === this.lastSubmittedEndpoints) return;
-    this.lastSubmittedEndpoints = serialized;
+    if (!force && haUrl === this.lastSubmittedEndpoints) return;
+    this.lastSubmittedEndpoints = haUrl;
     const invoke = window.__TAURI_INTERNALS__?.invoke;
     if (!invoke) return;
-    this.endpointSubmission = invoke("set_service_endpoints", { assistantUrl, haUrl }).catch(() => undefined);
-  }
-
-  /** Restores the last known release so an update found yesterday still shows after a restart. */
-  private restoreUpdateState(): void {
-    try {
-      this.updateState = parseUpdateState(localStorage.getItem(UPDATE_STORAGE_KEY));
-    } catch {
-      this.updateState = { lastCheckedAtMs: null, release: null };
-    }
-    const release = this.updateState.release;
-    if (release && isNewerVersion(release.version, APP_VERSION)) {
-      this.availableUpdate = release;
-      invokeTauriVoid("set_update_available", { version: release.version });
-    }
-  }
-
-  private saveUpdateState(): void {
-    try {
-      localStorage.setItem(UPDATE_STORAGE_KEY, serializeUpdateState(this.updateState));
-    } catch {
-      // Quota errors only cost the "once per day" memory, never the check itself.
-    }
-  }
-
-  /**
-   * Automatic check is skipped outside Tauri (browser preview/tests) because the CSP only
-   * allows `native_http`. `manual` is an explicit user action, so it bypasses the daily
-   * limit and the auto-check switch (#39).
-   */
-  private async checkForAppUpdate(manual: boolean): Promise<void> {
-    if (!manual && !window.__TAURI_INTERNALS__?.invoke) return;
-    if (this.isCheckingUpdate || this.isInstallingUpdate) return;
-    if (manual) {
-      this.isCheckingUpdate = true;
-      this.updateStatusMessage = null;
-      this.render();
-    }
-    const result = await checkForUpdate({
-      currentVersion: APP_VERSION,
-      enabled: manual || this.settings.autoCheckUpdates,
-      lastCheckedAtMs: this.updateState.lastCheckedAtMs,
-      nowMs: Date.now(),
-      force: manual,
-      requestLatest: () =>
-        this.transport({
-          url: UPDATE_RELEASES_URL,
-          method: "GET",
-          headers: {
-            Accept: "application/vnd.github+json",
-            "User-Agent": "MenuBarMijia-Windows",
-          },
-          timeoutMs: 8000,
-        }),
-    });
-    this.isCheckingUpdate = false;
-    if (!result.requested) return;
-
-    this.updateState = { lastCheckedAtMs: result.checkedAtMs, release: result.release };
-    this.saveUpdateState();
-    if (result.updateAvailable && result.release) {
-      this.availableUpdate = result.release;
-      this.updateStatusMessage = null;
-      invokeTauriVoid("set_update_available", { version: result.release.version });
-      this.render();
-    } else if (!result.failed && this.availableUpdate) {
-      // A successful check with no newer release retires yesterday's notice.
-      this.availableUpdate = null;
-      this.updateStatusMessage = manual
-        ? { text: t("已是最新版本 v{version}", { version: APP_VERSION }), isError: false }
-        : null;
-      invokeTauriVoid("set_update_available", { version: null });
-      this.render();
-    } else if (manual) {
-      const text = result.failed ? t("检查更新失败，请稍后再试") : t("已是最新版本 v{version}", { version: APP_VERSION });
-      this.updateStatusMessage = { text, isError: result.failed };
-      this.replyBanner = {
-        text,
-        source: t("检查更新"),
-        isError: result.failed,
-      };
-      this.render();
-    }
+    this.endpointSubmission = invoke("set_service_endpoints", { haUrl }).catch(() => undefined);
   }
 
   private openSettingsSheet(): void {
     this.activeSheet = "settings";
     invokeTauriVoid("set_pin_popover", { pin: true });
     this.render();
-    void this.checkForAppUpdate(false);
   }
 
-  private openUpdatePage(): void {
-    invokeTauriVoid("open_release_page", { url: this.availableUpdate?.htmlURL ?? UPDATE_RELEASES_PAGE });
-  }
-
-  private async startUpdateInstall(): Promise<void> {
-    if (this.isInstallingUpdate || !this.availableUpdate) return;
-    const asset = this.availableUpdate.installerAsset;
-    if (!asset) {
-      this.openUpdatePage();
-      return;
-    }
-    const invoke = window.__TAURI_INTERNALS__?.invoke;
-    if (!invoke) {
-      this.openUpdatePage();
-      return;
-    }
-    this.isInstallingUpdate = true;
-    this.updateStatusMessage = {
-      text: t("正在下载并校验 v{version} 安装包，完成后将自动启动安装…", { version: this.availableUpdate.version }),
-      isError: false,
-    };
-    this.render();
-    try {
-      await invoke("install_update", { asset });
-      this.isInstallingUpdate = false;
-      this.render();
-    } catch (error) {
-      this.isInstallingUpdate = false;
-      const message =
-        typeof error === "string" && error.trim().length > 0
-          ? error
-          : error instanceof Error && error.message.trim().length > 0
-            ? error.message
-            : t("下载或校验更新包失败，请重试或手动下载");
-      this.updateStatusMessage = { text: message, isError: true };
-      this.render();
-    }
-  }
-
-  /**
-   * Synchronizes the Windows global shortcut registration with the current preference (#43),
-   * unregistering immediately when disabled (Coding Standard #3) and surfacing conflicts.
-   */
   private async applyGlobalHotkey(): Promise<void> {
     const enabled = this.settings.enableGlobalHotkey;
     const shortcut = normalizeGlobalShortcut(this.settings.globalHotkey);
@@ -1161,11 +902,8 @@ export class MenuMijiaWindowsApp {
         return;
       }
 
+      if (e.isComposing) return;
       if (e.key === "Escape") {
-        if (this.isGrokBallStageExpanded) {
-          this.setGrokBallStageExpanded(false);
-          return;
-        }
         if (this.activeLiveCameraId !== null) {
           this.hideCameraLiveView();
           return;
@@ -1176,14 +914,17 @@ export class MenuMijiaWindowsApp {
           this.hotkeyNeedsHint = false;
           invokeTauriVoid("set_pin_popover", { pin: false });
           this.render();
+        } else if (this.isDeviceSearchOpen) {
+          e.preventDefault();
+          this.setDeviceSearchOpen(false);
         } else {
           invokeTauriVoid("hide_panel");
         }
-      } else if (e.key === "/" && document.activeElement?.tagName !== "INPUT") {
+      } else if ((e.ctrlKey && e.key.toLowerCase() === "f") ||
+                 (e.key === "/" && !["INPUT", "TEXTAREA"].includes(document.activeElement?.tagName ?? ""))) {
+        if (this.activeSheet !== "none" || this.activeLiveCameraId !== null || this.prompt) return;
         e.preventDefault();
-        this.isShowingAssistantBar = true;
-        this.render();
-        this.root.querySelector<HTMLInputElement>("#command-input")?.focus();
+        this.setDeviceSearchOpen(true);
       }
     });
   }
@@ -1194,27 +935,11 @@ export class MenuMijiaWindowsApp {
         this.render();
       }
 
-      this.maybeRefreshProactiveInBackground();
-
       const now = Date.now();
-      this.syncGrokBallEmotion();
       let changed = false;
 
       if (this.lastUndoAction && this.lastUndoAction.expiresAtMs <= now) {
         this.lastUndoAction = null;
-        changed = true;
-      }
-
-      // After sleep the interval resumes late; a timer more than a minute overdue is not run silently (#22).
-      const { run, missed, remaining } = partitionDueTimers(this.scheduledCommands, now);
-      if (run.length > 0 || missed.length > 0) {
-        this.scheduledCommands = remaining;
-        this.missedScheduledCommands.push(...missed);
-        changed = true;
-        for (const item of run) {
-          void this.handleNaturalCommand(item.command, true);
-        }
-      } else if (this.scheduledCommands.length > 0) {
         changed = true;
       }
 
@@ -1244,7 +969,6 @@ export class MenuMijiaWindowsApp {
     return (
       this.activeSheet !== "none" ||
       this.pointerIsDown ||
-      this.isListeningVoice ||
       this.draggingId !== null ||
       this.isEditingLayout ||
       this.isHomeMenuOpen ||
@@ -1267,9 +991,71 @@ export class MenuMijiaWindowsApp {
     return ["全部", ...unique];
   }
 
+  private get roomDevices(): SmartDevice[] {
+    const devices = this.visibleDevices;
+    return this.selectedRoom === "全部"
+      ? devices
+      : devices.filter((d) => d.roomName === this.selectedRoom);
+  }
+
+  private get hiddenDeviceIds(): readonly string[] {
+    const ids = this.layout.hiddenDeviceIds?.[this.settings.connectionMode];
+    return Array.isArray(ids) ? ids : [];
+  }
+
+  private get visibleDevices(): SmartDevice[] {
+    const hidden = new Set(this.hiddenDeviceIds);
+    return this.devices.filter((device) => !hidden.has(device.id) &&
+      (this.layout.hideOfflineDevices !== true || device.isOnline));
+  }
+
+  private setDeviceHidden(id: string, hidden: boolean): void {
+    const ids = new Set(this.hiddenDeviceIds);
+    if (hidden) ids.add(id);
+    else ids.delete(id);
+    this.layout.hiddenDeviceIds = {
+      ...this.layout.hiddenDeviceIds,
+      [this.settings.connectionMode]: [...ids],
+    };
+    if (hidden && this.expandedDeviceId === id) this.expandedDeviceId = null;
+    this.ctxMenu = null;
+    this.saveLayout();
+    this.render();
+  }
+
   private get filteredDevices(): SmartDevice[] {
-    if (this.selectedRoom === "全部") return this.devices;
-    return this.devices.filter((d) => d.roomName === this.selectedRoom);
+    const terms = this.deviceSearch.trim().normalize("NFKC").toLowerCase().split(/\s+/).filter(Boolean);
+    const devices = this.roomDevices;
+    if (terms.length === 0) return devices;
+    return devices.filter((device) => {
+      const fields = [device.name, this.layout.aliases[device.id] ?? "", device.roomName];
+      const searchable = fields.flatMap((field) => {
+        const text = field.normalize("NFKC").toLowerCase();
+        const syllables = pinyin(text, { toneType: "none", type: "array" });
+        return [text, syllables.join(""), syllables.map((syllable) => syllable[0]).join("")];
+      });
+      return terms.every((term) => searchable.some((value) => value.includes(term)));
+    });
+  }
+
+  private setDeviceSearch(query: string): void {
+    if (query === this.deviceSearch) return;
+    this.deviceSearch = query;
+    const search = this.root.querySelector<HTMLInputElement>("#device-search");
+    if (search && search.value !== query) search.value = query;
+    this.expandedDeviceId = null;
+    this.render();
+    const area = this.root.querySelector(".cc-scroll-area");
+    if (area) area.scrollTop = 0;
+  }
+
+  private setDeviceSearchOpen(open: boolean): void {
+    if (open !== this.isDeviceSearchOpen) {
+      this.isDeviceSearchOpen = open;
+      if (!open && this.deviceSearch) this.setDeviceSearch("");
+      else this.render();
+    }
+    this.root.querySelector<HTMLElement>(open ? "#device-search" : "#btn-device-search")?.focus();
   }
 
   private get activeDeviceCount(): number {
@@ -1291,17 +1077,18 @@ export class MenuMijiaWindowsApp {
   }
 
   private get computedEnvironmentReadings(): EnvironmentReading[] {
+    const devices = this.visibleDevices;
     if (this.environmentReadings.length > 0) {
       const priorityById = new Map(
-        this.devices.map((d) => [d.id, environmentReadingPriority(d.kind)]),
+        devices.map((d) => [d.id, environmentReadingPriority(d.kind)]),
       );
-      return [...this.environmentReadings].sort(
+      return this.environmentReadings.filter((reading) => priorityById.has(reading.id)).sort(
         (a, b) => (priorityById.get(a.id) ?? 0) - (priorityById.get(b.id) ?? 0),
       );
     }
     const out: Array<{ reading: EnvironmentReading; priority: number; index: number }> = [];
-    for (let i = 0; i < this.devices.length; i++) {
-      const d = this.devices[i]!;
+    for (let i = 0; i < devices.length; i++) {
+      const d = devices[i]!;
       const reading = deviceEnvironmentReading(d);
       if (reading) {
         out.push({
@@ -1324,6 +1111,7 @@ export class MenuMijiaWindowsApp {
     const stateRevisionAtStart = this.localControlRevision;
     const syncGen = ++this.syncGeneration;
     let presentationChanged = false;
+    let clearedSyncError = false;
     this.isSyncingCloud = true;
     this.lastCloudRefreshAt = Date.now();
     if (!silent) {
@@ -1398,22 +1186,18 @@ export class MenuMijiaWindowsApp {
         this.saveSettings();
       }
 
-      if (!silent) {
-        this.replyBanner = {
-          text:
-            home.devices.length > 0
-              ? t("已同步 {count} 台真实米家设备", { count: home.devices.length })
-              : t("当前小米账号下暂未发现米家设备"),
-          source: t("米家云直连"),
-        };
+      if (this.replyBanner?.isCloudSyncError) {
+        this.replyBanner = null;
+        clearedSyncError = true;
       }
     } catch (err) {
-      if (!silent) {
+      if (!silent && this.syncGeneration === syncGen && !this.cloudSnapshotIsStale(session, stateRevisionAtStart)) {
         const msg = err instanceof Error ? err.message : String(err);
         this.replyBanner = {
           text: t("米家云同步失败：{message}", { message: msg }),
           source: t("连接异常"),
           isError: true,
+          isCloudSyncError: true,
         };
       }
     } finally {
@@ -1421,6 +1205,8 @@ export class MenuMijiaWindowsApp {
         this.isSyncingCloud = false;
         if (!silent) {
           this.render();
+        } else if (clearedSyncError) {
+          this.queueBackgroundRender();
         } else if (presentationChanged) {
           if (
             this.cloudPanelStructureFingerprint() !== previousStructure ||
@@ -1529,6 +1315,7 @@ export class MenuMijiaWindowsApp {
           roomId: device.roomId,
           roomName: device.roomName,
           model: device.model,
+          online: this.layout.hideOfflineDevices === true ? device.isOnline : undefined,
           category: kind.kind,
           capabilities,
           sensorShape:
@@ -1583,7 +1370,7 @@ export class MenuMijiaWindowsApp {
       } else if (current) {
         current.remove();
       } else if (desired) {
-        this.root.querySelector("#btn-hide-panel")?.before(desired);
+        this.root.querySelector("#btn-device-search")?.before(desired);
         this.bindAllOffControl();
       }
     }
@@ -1618,7 +1405,6 @@ export class MenuMijiaWindowsApp {
             })
           : this.settings.connectionMode === "homeAssistant" ? `Home Assistant · ${this.devices.length}` : t("演示模式 · 未连接米家云");
     }
-    this.syncGrokBallEmotion();
     return true;
   }
 
@@ -1641,14 +1427,7 @@ export class MenuMijiaWindowsApp {
     this.settings.selectedHomeId = id;
     this.isHomeMenuOpen = false;
     this.selectedRoom = "全部";
-    // A different home is a different suggestion context even at the same ambient signature (Codex #116 review).
-    this.aiProactiveSuggestions = null;
-    this.aiProactiveSignature = null;
-    this.isRefreshingProactive = false;
-    this.proactiveRetryAfterMs = null;
-    this.isGrokBallStageExpanded = false;
-    this.grokBallCelebrationUntil = 0;
-    this.applyPanelHeight();
+    this.invalidateSourceControl();
     this.saveSettings();
     this.render();
     void this.refreshDevices(false);
@@ -1661,7 +1440,7 @@ export class MenuMijiaWindowsApp {
 
   /** Devices 全关 would switch off: on screen (current room), on, and taking part (#23). */
   private get allOffTargets(): SmartDevice[] {
-    return allOffTargets(this.filteredDevices, this.settings.allOffOverrides);
+    return allOffTargets(this.roomDevices, this.settings.allOffOverrides);
   }
 
   private renderAllOffControl(): string {
@@ -1714,187 +1493,7 @@ export class MenuMijiaWindowsApp {
       intents,
       t("已关闭 {count} 台开启中的设备", { count: targets.length }),
       t("一键全关"),
-      { recordHabits: true },
     );
-  }
-
-  private async handleNaturalCommand(rawInput: string, fromScheduled = false): Promise<void> {
-    const trimmed = rawInput.trim();
-    if (!trimmed) return;
-    const sourceRevision = this.sourceRevision;
-    // A new command replaces any question still waiting for cloud consent, and old suggestions.
-    this.pendingCloudConsent = null;
-    this.pendingSuggestions = [];
-
-    if (UndoPhrase.isUndo(trimmed)) {
-      await this.performUndo();
-      return;
-    }
-
-    if (DelayPhrase.isCancel(trimmed)) {
-      const count = this.scheduledCommands.length + this.missedScheduledCommands.length;
-      this.scheduledCommands = [];
-      this.missedScheduledCommands = [];
-      this.replyBanner = {
-        text: count > 0 ? t("已取消 {count} 项定时指令", { count: count }) : t("当前没有待执行的定时指令"),
-        source: t("0ms 本地直达"),
-      };
-      this.render();
-      return;
-    }
-
-    if (!fromScheduled) {
-      const delaySpec = DelayPhrase.extract(trimmed);
-      if (delaySpec) {
-        const scheduled: ScheduledCommand = {
-          id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-          command: delaySpec.remainder,
-          delaySeconds: delaySpec.seconds,
-          fireTimestampMs: Date.now() + delaySpec.seconds * 1000,
-          reply: t("{delay}后：{command}", { delay: DelayPhrase.formatDelay(delaySpec.seconds), command: delaySpec.remainder }),
-        };
-        this.scheduledCommands.push(scheduled);
-        this.replyBanner = {
-          text: t("已设定 {delay}后执行「{command}」", { delay: DelayPhrase.formatDelay(delaySpec.seconds), command: delaySpec.remainder }),
-          source: t("定时任务"),
-        };
-        this.render();
-        return;
-      }
-    }
-
-    const learnedMatch = this.settings.learnedShortcuts.find(
-      (s) => s.phrase.replace(/\s+/g, "") === trimmed.replace(/\s+/g, ""),
-    );
-    if (learnedMatch) {
-      // A timer firing a learned phrase is not a user action, so it never trains habits (#34/#113).
-      await this.executeIntents(learnedMatch.intents, learnedMatch.reply, t("习惯记忆 0ms"), { recordHabits: !fromScheduled });
-      return;
-    }
-
-    this.isResolvingIntent = true;
-    this.render();
-
-    try {
-      const aliasedDevices = withAliases(this.layout, this.devices);
-      const localPlan = LocalIntentParser.parse(trimmed, aliasedDevices, this.scenes);
-      let plan: IntentPlan | null = localPlan;
-      let sourceLabel = t("0ms 本地直达");
-
-      if (!plan) {
-        const baseURL = this.settings.assistantBaseURL.trim() || "https://openrouter.ai/api/v1";
-        const apiKey = this.apiKeyFor(baseURL);
-        const isLoopback = isLocalAssistantEndpoint(baseURL);
-        if (!endpointAllowsSendingSecrets(baseURL)) {
-          this.replyBanner = { text: INSECURE_ENDPOINT_MESSAGE, source: t("地址不安全"), isError: true };
-          this.isResolvingIntent = false;
-          this.render();
-          return;
-        }
-        if (!apiKey && !isLoopback) {
-          this.replyBanner = {
-            text: t("未命中本地规则。请在设置中填写 AI 服务的 API Key（支持 OpenRouter Jev、原生 Jev、DeepSeek 等）。"),
-            source: t("需要 API Key"),
-            isError: true,
-          };
-          this.isResolvingIntent = false;
-          this.render();
-          return;
-        }
-        const endpoint = assistantEndpointIdentity(baseURL);
-        if (!isLoopback && endpoint && !this.settings.cloudConsentEndpoints.includes(endpoint)) {
-          this.pendingCloudConsent = { utterance: trimmed, endpoint };
-          this.replyBanner = {
-            text: t("这句话本机没听懂，要交给云端 AI（{endpoint}）处理吗？会发送：这句话、设备名称/房间/状态。只问这一次，可在设置里撤销。", { endpoint: endpoint }),
-            source: t("需要确认"),
-          };
-          this.isResolvingIntent = false;
-          this.render();
-          return;
-        }
-        const resolver = new ModelIntentResolver(
-          {
-            baseURL,
-            model: this.settings.assistantModel,
-            apiKey,
-          },
-          this.transport,
-        );
-        // Same ambient context macOS sends with Jev requests (#38); the getter falls
-        // back to sensor devices when no refreshed EnvironmentReading list exists.
-        const readings = this.computedEnvironmentReadings;
-        const context = buildAssistantContext({
-          now: new Date(),
-          readings,
-          devices: aliasedDevices,
-          habitSummary: buildHabitSummary(
-            this.settings.habitLearningEnabled,
-            this.settings.learnedShortcuts,
-            new UserHabitMemory(this.settings.habitEntries, this.habitSequences(), this.lastHabitAction()),
-            this.devices,
-            this.scenes,
-          ),
-        });
-        plan = await resolver.resolve(trimmed, aliasedDevices, this.scenes, context);
-        if (sourceRevision !== this.sourceRevision) return;
-        sourceLabel = resolver.usesSystemOne ? "Jev SystemOne" : this.settings.assistantModel;
-      }
-
-      const sanitized = IntentValidator.sanitize(plan.intents, aliasedDevices, this.scenes);
-      this.pendingSuggestions = [...plan.suggestions];
-      if (sanitized.length === 0 && plan.suggestions.length > 0) {
-        this.replyBanner = { text: plan.reply || ModelActionPolicy.confirmationReply(null), source: t("需要确认") };
-        return;
-      }
-      const replyText =
-        plan.reply || IntentReply.describe(sanitized, aliasedDevices, this.scenes);
-      const succeeded = await this.executeIntents(sanitized, replyText, sourceLabel, {
-        recordHabits: plan.source === "local" && !fromScheduled,
-      });
-      if (sourceRevision !== this.sourceRevision) return;
-
-      if (
-        succeeded &&
-        this.settings.habitLearningEnabled &&
-        plan.source === "model" &&
-        sanitized.length > 0
-      ) {
-        this.learnShortcut(trimmed, replyText, sanitized);
-      }
-    } catch (err) {
-      if (sourceRevision !== this.sourceRevision) return;
-      const msg = err instanceof Error ? err.message : String(err);
-      this.replyBanner = {
-        text: msg,
-        source: t("出错提示"),
-        isError: true,
-      };
-    } finally {
-      if (sourceRevision === this.sourceRevision) {
-        this.isResolvingIntent = false;
-        this.render();
-      }
-    }
-  }
-
-  private learnShortcut(
-    phrase: string,
-    reply: string,
-    intents: readonly DeviceIntent[],
-  ): void {
-    const clean = phrase.trim();
-    if (clean.length < 2 || clean.length > 18) return;
-    if (this.settings.learnedShortcuts.some((s) => s.phrase === clean)) return;
-    this.settings.learnedShortcuts.unshift({
-      phrase: clean,
-      reply,
-      intents,
-      learnedAt: new Date().toISOString(),
-    });
-    if (this.settings.learnedShortcuts.length > 25) {
-      this.settings.learnedShortcuts.length = 25;
-    }
-    this.saveSettings();
   }
 
   private buildInverseCommand(dev: SmartDevice, command: DeviceCommand): DeviceCommand[] {
@@ -1979,7 +1578,6 @@ export class MenuMijiaWindowsApp {
     intents: readonly DeviceIntent[],
     replyText: string,
     sourceLabel: string,
-    options: { recordHabits?: boolean } = {},
   ): Promise<boolean> {
     const sourceRevision = this.sourceRevision;
     const commands: Array<{ deviceId: string; command: DeviceCommand }> = [];
@@ -1994,6 +1592,12 @@ export class MenuMijiaWindowsApp {
       for (const command of IntentValidator.commandsForIntent(intent, dev)) {
         commands.push({ deviceId: dev.id, command });
       }
+    }
+
+    if (commands.length === 0) {
+      this.replyBanner = { text: t("当前房间没有可执行此操作的设备"), source: t("提示") };
+      this.render();
+      return false;
     }
 
     const steps: UndoStep[] = [];
@@ -2031,9 +1635,6 @@ export class MenuMijiaWindowsApp {
     }
     if (sourceRevision !== this.sourceRevision) return false;
     if (succeeded > 0) {
-      if (failed === 0) this.grokBallCelebrationUntil = Date.now() + 2400;
-      // Only explicit user asks train habits; model-inferred and scheduled runs do not (#34/#113).
-      const habitReceipt = options.recordHabits && failed === 0 ? this.recordHabits(intents) : null;
       // Scene activations have no inverse: an undo action must exist only when at least one
       // device step is restorable, otherwise Undo would report success without doing anything
       // (Codex #116 re-review).
@@ -2041,7 +1642,6 @@ export class MenuMijiaWindowsApp {
         summary: replyText,
         steps,
         expiresAtMs: Date.now() + 10 * 60 * 1000,
-        habitReceipt: habitReceipt ?? undefined,
       } : null;
     }
     this.replyBanner = failed > 0
@@ -2055,302 +1655,27 @@ export class MenuMijiaWindowsApp {
     device: SmartDevice,
     command: DeviceCommand,
     summary: string,
-    intent?: DeviceIntent,
   ): Promise<void> {
     const sourceRevision = this.sourceRevision;
     const inverseCommands = this.buildInverseCommand(device, command);
     if (!(await this.applyCommand(command))) return;
     if (sourceRevision !== this.sourceRevision) return;
-    this.grokBallCelebrationUntil = Date.now() + 2400;
-    const habitReceipt = intent ? this.recordHabits([intent]) : null;
     this.lastUndoAction = inverseCommands.length > 0 ? {
       summary,
       steps: [{ deviceId: device.id, commands: inverseCommands }],
       expiresAtMs: Date.now() + 10 * 60 * 1000,
-      habitReceipt: habitReceipt ?? undefined,
     } : null;
     this.replyBanner = { text: summary, source: t("实时控制") };
     this.render();
-  }
-
-  /** Records manual card actions into the habit memory for the current time bucket (#113). */
-  private recordHabits(intents: readonly DeviceIntent[]): HabitRecordingReceipt | null {
-    if (!this.settings.habitLearningEnabled || intents.length === 0) return null;
-    const memory = new UserHabitMemory(this.settings.habitEntries, this.habitSequences(), this.lastHabitAction());
-    const receipt = memory.record(intents, this.devices, this.scenes, new Date());
-    if (receipt) this.saveHabitMemory(memory);
-    return receipt;
-  }
-
-  /** Sequence entries and lastAction persist alongside the entries (ADR-0009). */
-  private habitSequences(): HabitSequenceEntry[] {
-    const raw = localStorage.getItem("menumijia.windows.habit.sequences.v1");
-    if (!raw) return [];
-    try {
-      const parsed = JSON.parse(raw) as { sequences?: HabitSequenceEntry[]; lastAction?: HabitLastAction | null };
-      return Array.isArray(parsed.sequences) ? parsed.sequences : [];
-    } catch {
-      return [];
-    }
-  }
-
-  private lastHabitAction(): HabitLastAction | null {
-    const raw = localStorage.getItem("menumijia.windows.habit.sequences.v1");
-    if (!raw) return null;
-    try {
-      const parsed = JSON.parse(raw) as { lastAction?: HabitLastAction | null };
-      return parsed.lastAction ?? null;
-    } catch {
-      return null;
-    }
-  }
-
-  private saveHabitMemory(memory: UserHabitMemory): void {
-    this.settings.habitEntries = [...memory.entries];
-    this.saveSettings();
-    try {
-      localStorage.setItem("menumijia.windows.habit.sequences.v1", JSON.stringify({
-        sequences: memory.sequences,
-        lastAction: memory.lastAction,
-      }));
-    } catch {
-      // Quota errors only cost the sequence context, never the entries.
-    }
-  }
-
-  private unrecordHabits(receipt: HabitRecordingReceipt): void {
-    const memory = new UserHabitMemory(this.settings.habitEntries, this.habitSequences(), this.lastHabitAction());
-    memory.unrecord(receipt);
-    this.saveHabitMemory(memory);
-  }
-
-  /** Time bucket + per-room temperature (1 °C steps) and humidity (5 % steps): the ambient signature (#113). */
-  private proactiveSignature(): string {
-    const bucket = timeBucketLabel(new Date().getHours());
-    const readings = this.computedEnvironmentReadings
-      .map(
-        (reading) =>
-          `${reading.temperature !== null ? Math.round(reading.temperature) : "-"}|${
-            reading.humidity !== null ? Math.round(reading.humidity / 5) * 5 : "-"
-          }`,
-      )
-      .join(",");
-    return `${bucket}|${readings}`;
-  }
-
-  private isIntentReversibleOnDevice(intent: DeviceIntent, device: SmartDevice): { reversible: boolean; nextDevice: SmartDevice } {
-    if (!device.isOnline || (device.kind.kind === "plug" && device.kind.switchEntityId.startsWith("button."))) {
-      return { reversible: false, nextDevice: device };
-    }
-    const normalized = IntentValidator.normalize(intent.operation, device);
-    if (!normalized) return { reversible: false, nextDevice: device };
-    if (
-      this.settings.connectionMode === "homeAssistant" &&
-      normalized.kind === "power" &&
-      normalized.isOn &&
-      device.kind.kind === "climate" &&
-      !device.kind.availableModes.some((mode) => mode !== "off" && mode !== "unknown" && mode !== "unavailable")
-    ) {
-      return { reversible: false, nextDevice: device };
-    }
-    const normalizedIntent: DeviceIntent = { targetId: intent.targetId, operation: normalized };
-    const commands = IntentValidator.commandsForIntent(normalizedIntent, device);
-    if (commands.length === 0 || !commands.every((command) => this.buildInverseCommand(device, command).length > 0)) {
-      return { reversible: false, nextDevice: device };
-    }
-    const k = device.kind;
-    let nextKind = k;
-    if (k.kind === "light") {
-      if (normalized.kind === "power") nextKind = { ...k, isOn: normalized.isOn };
-      else if (normalized.kind === "brightness") nextKind = { ...k, isOn: true, brightnessPercent: normalized.percent };
-      else if (normalized.kind === "colorTemperature") nextKind = { ...k, isOn: true, colorTempKelvin: normalized.kelvin, currentEffect: null };
-      else if (normalized.kind === "lightEffect") nextKind = { ...k, isOn: true, currentEffect: normalized.effect };
-    } else if (k.kind === "climate") {
-      if (normalized.kind === "power") {
-        const resumeMode = k.hvacMode === "off" ? (k.availableModes.find((m) => m !== "off") ?? "cool") : k.hvacMode;
-        nextKind = { ...k, isOn: normalized.isOn, hvacMode: normalized.isOn ? resumeMode : "off" };
-      } else if (normalized.kind === "hvacMode") {
-        nextKind = { ...k, isOn: normalized.mode !== "off", hvacMode: normalized.mode };
-      } else if (normalized.kind === "targetTemperature") {
-        nextKind = { ...k, targetTemperature: normalized.celsius };
-      } else if (normalized.kind === "fanSpeed") {
-        nextKind = { ...k, fanMode: normalized.speed };
-      }
-    }
-    return { reversible: true, nextDevice: { ...device, kind: nextKind } };
-  }
-
-  /** The Top-4 zero-delay suggestions: the AI cache when fresh, otherwise ranked locally (#113). */
-  private currentProactiveSuggestions(): AssistantSuggestion[] {
-    if (this.pendingSuggestions.length > 0 && !this.isGrokBallStageExpanded) return [];
-    const signature = this.proactiveSignature();
-    const aliasedDevices = withAliases(this.layout, this.devices);
-    const local = new UserHabitMemory(this.settings.habitEntries, this.habitSequences(), this.lastHabitAction()).topSuggestions({
-      devices: aliasedDevices,
-      scenes: this.isGrokBallStageExpanded ? [] : this.scenes,
-      environmentReadings: this.computedEnvironmentReadings,
-    });
-    const cached = this.aiProactiveSignature === signature ? this.aiProactiveSuggestions ?? [] : [];
-    const fallback = this.isGrokBallStageExpanded
-      ? new UserHabitMemory([]).topSuggestions({ devices: aliasedDevices, scenes: [], limit: aliasedDevices.length + 4 })
-      : [];
-    const result: AssistantSuggestion[] = [];
-    for (const item of [...cached, ...local, ...fallback]) {
-      if (this.isGrokBallStageExpanded && item.intents.some((intent) => intent.operation.kind === "activateScene")) continue;
-      const actionableIntents = item.intents.filter((intent) => habitActionable(intent, aliasedDevices, this.scenes));
-      if (actionableIntents.length === 0) continue;
-      if (this.isGrokBallStageExpanded) {
-        if (!item.intents.every((intent) => aliasedDevices.some((entry) => entry.id === intent.targetId && entry.isOnline))) continue;
-        const stateByTarget = new Map<string, SmartDevice>();
-        let allReversible = true;
-        for (const intent of actionableIntents) {
-          const current = stateByTarget.get(intent.targetId) ?? aliasedDevices.find((entry) => entry.id === intent.targetId);
-          if (!current) {
-            allReversible = false;
-            break;
-          }
-          const check = this.isIntentReversibleOnDevice(intent, current);
-          if (!check.reversible) {
-            allReversible = false;
-            break;
-          }
-          stateByTarget.set(intent.targetId, check.nextDevice);
-        }
-        if (!allReversible) continue;
-      }
-      const candidate: AssistantSuggestion = { ...item, intents: actionableIntents };
-      if (result.some((existing) => JSON.stringify(existing.intents) === JSON.stringify(candidate.intents))) continue;
-      result.push(candidate);
-      if (result.length === 4) break;
-    }
-    return result;
-  }
-
-  private syncGrokBallEmotion(): void {
-    const now = Date.now();
-    this.grokBall.setEmotion(resolveGrokBallEmotion({
-      timeBucket: timeBucketLabel(new Date(now).getHours()),
-      activeDeviceCount: this.activeDeviceCount,
-      speechListening: this.isListeningVoice,
-      assistantState: this.isResolvingIntent ? "thinking" : this.pendingSuggestions.length > 0 ? "awaitingChoice" : "idle",
-      isRecommending: this.isRefreshingProactive,
-      hasErrorToast: this.replyBanner?.isError === true || Boolean(this.haConnectionError),
-      isStageExpanded: this.isGrokBallStageExpanded,
-      isPointerTracking: now < this.grokBallPointerUntil,
-      hasRecentCelebration: now < this.grokBallCelebrationUntil,
-    }));
-  }
-
-  private renderGrokBallStage(): string {
-    if (!this.isGrokBallStageExpanded) return "";
-    return `<section class="cc-grok-stage" aria-label="${t("猜你想控")}">
-      ${this.currentProactiveSuggestions().slice(0, 4).map((item) => `
-        <button class="cc-grok-pill" data-proactive-id="${this.escapeHtml(item.id)}" title="${this.escapeHtml(item.title)}">
-          ${this.escapeHtml(item.title)}</button>`).join("")}
-    </section>`;
-  }
-
-  private renderGrokBallSidebar(): string {
-    return `<aside class="cc-grok-sidebar" aria-label="${t("猜你想控")}">
-      <button class="cc-grok-toggle" id="btn-grok-ball" data-grok-toggle aria-label="${t("猜你想控")}" aria-expanded="${this.isGrokBallStageExpanded}"><span data-grok-slot></span></button>
-      ${this.renderGrokBallStage()}
-    </aside>`;
-  }
-
-  private setGrokBallStageExpanded(expanded: boolean): void {
-    if (this.isGrokBallStageExpanded === expanded) return;
-    this.isGrokBallStageExpanded = expanded;
-    this.applyPanelHeight();
-    if (window.__TAURI_INTERNALS__) {
-      void this.panelGeometryUpdates.then(() => this.render());
-    } else {
-      this.render();
-    }
-  }
-
-  /**
-   * Silent background AI refresh for proactive suggestions (#113): fires only when the
-   * time bucket or room climate changed, never blocks the panel, never asks for consent,
-   * and keeps the previous cache when the request fails.
-   */
-  private maybeRefreshProactiveInBackground(): void {
-    if (this.isRefreshingProactive || this.settings.connectionMode === "demo") return;
-    if (this.proactiveRetryAfterMs !== null && Date.now() < this.proactiveRetryAfterMs) return;
-    const signature = this.proactiveSignature();
-    if (signature === this.aiProactiveSignature) return;
-    const baseURL = this.settings.assistantBaseURL.trim() || "https://openrouter.ai/api/v1";
-    if (!endpointAllowsSendingSecrets(baseURL)) return;
-    const apiKey = this.apiKeyFor(baseURL);
-    const isLoopback = isLocalAssistantEndpoint(baseURL);
-    if (!apiKey && !isLoopback) return;
-    if (!isLoopback) {
-      const endpoint = assistantEndpointIdentity(baseURL);
-      if (!endpoint || !this.settings.cloudConsentEndpoints.includes(endpoint)) return;
-    }
-    const sourceRevision = this.sourceRevision;
-    const selectedHomeId = this.settings.selectedHomeId;
-    this.isRefreshingProactive = true;
-    const resolver = new ModelIntentResolver(
-      { baseURL, model: this.settings.assistantModel, apiKey },
-      this.transport,
-    );
-    resolver
-      .recommendProactiveSuggestions(
-        this.devices,
-        this.scenes,
-        buildAssistantContext({
-          now: new Date(),
-          readings: this.computedEnvironmentReadings,
-          devices: this.devices,
-          habitSummary: buildHabitSummary(
-            this.settings.habitLearningEnabled,
-            this.settings.learnedShortcuts,
-            new UserHabitMemory(this.settings.habitEntries, this.habitSequences(), this.lastHabitAction()),
-            this.devices,
-            this.scenes,
-          ),
-        }),
-      )
-      .then((suggestions) => {
-        if (sourceRevision !== this.sourceRevision || this.settings.selectedHomeId !== selectedHomeId) return;
-        this.isRefreshingProactive = false;
-        if (this.proactiveSignature() === signature) {
-          // The context counts as served only once a usable result landed (Codex #116 review).
-          this.aiProactiveSignature = signature;
-          if (suggestions.length > 0) {
-            this.aiProactiveSuggestions = suggestions;
-          } else {
-            // An empty result is a valid "home is ideal" answer: drop any older cache so the
-            // local ranking takes over instead of stale suggestions (Codex #116 re-review).
-            this.aiProactiveSuggestions = null;
-          }
-          if (!this.hasBlockingPanelInteraction()) this.render();
-        }
-      })
-      .catch(() => {
-        if (sourceRevision !== this.sourceRevision || this.settings.selectedHomeId !== selectedHomeId) return;
-        // Silent: the previous cache keeps showing; retry after a cooldown (Codex #116 review).
-        this.isRefreshingProactive = false;
-        this.proactiveRetryAfterMs = Date.now() + MenuMijiaWindowsApp.PROACTIVE_RETRY_COOLDOWN_MS;
-      });
   }
 
   private invalidateSourceControl(): void {
     this.sourceRevision += 1;
     this.syncGeneration += 1;
     this.isSyncingCloud = false;
-    this.isResolvingIntent = false;
-    this.aiProactiveSuggestions = null;
-    this.aiProactiveSignature = null;
-    this.isRefreshingProactive = false;
-    this.proactiveRetryAfterMs = null;
-    this.isGrokBallStageExpanded = false;
-    this.grokBallCelebrationUntil = 0;
-    this.applyPanelHeight();
     this.haConnectionError = null;
     this.lastUndoAction = null;
-    this.pendingCloudConsent = null;
-    this.pendingSuggestions = [];
+    this.replyBanner = null;
   }
 
   private async performUndo(): Promise<void> {
@@ -2390,11 +1715,6 @@ export class MenuMijiaWindowsApp {
     this.lastUndoAction = failedSteps.length > 0
       ? { ...action, steps: failedSteps }
       : null;
-    // The habit records roll back only once every inverse command succeeded; a partially
-    // failed undo keeps them for the retry (Codex #116 re-review).
-    if (failedSteps.length === 0 && action.habitReceipt) {
-      this.unrecordHabits(action.habitReceipt);
-    }
     this.replyBanner = failedSteps.length > 0
       ? { text: t("撤销未完成，{count} 项待恢复。{message}", { count: failedSteps.length, message: failureMessage }), source: t("控制失败"), isError: true }
       : { text: t("已撤销：{summary}", { summary: action.summary }), source: t("已恢复") };
@@ -2574,55 +1894,6 @@ export class MenuMijiaWindowsApp {
     }
   }
 
-  private toggleVoiceInput(): void {
-    if (this.isListeningVoice) {
-      this.speechRecognition?.stop();
-      this.isListeningVoice = false;
-      this.render();
-      return;
-    }
-
-    const SpeechCtor = window.SpeechRecognition ?? window.webkitSpeechRecognition;
-    if (!SpeechCtor) {
-      this.isShowingAssistantBar = true;
-      this.replyBanner = {
-        text: t("当前系统环境不支持离线语音识别，请直接输入文字指令。"),
-        source: t("语音提示"),
-      };
-      this.render();
-      this.root.querySelector<HTMLInputElement>("#command-input")?.focus();
-      return;
-    }
-
-    this.isShowingAssistantBar = true;
-    const recognition = new SpeechCtor();
-    recognition.lang = speechLocale();
-    recognition.interimResults = false;
-    recognition.continuous = false;
-
-    recognition.onresult = (event) => {
-      const first = event.results[0]?.[0]?.transcript;
-      if (first) {
-        const inputEl = this.root.querySelector<HTMLInputElement>("#command-input");
-        if (inputEl) inputEl.value = "";
-        void this.handleNaturalCommand(first);
-      }
-    };
-    recognition.onerror = () => {
-      this.isListeningVoice = false;
-      this.render();
-    };
-    recognition.onend = () => {
-      this.isListeningVoice = false;
-      this.render();
-    };
-
-    this.speechRecognition = recognition;
-    this.isListeningVoice = true;
-    this.render();
-    recognition.start();
-  }
-
   private async startXiaomiQRLogin(): Promise<void> {
     if (this.isPollingQR) return;
     this.isPollingQR = true;
@@ -2668,16 +1939,6 @@ export class MenuMijiaWindowsApp {
       invokeTauriVoid("set_pin_popover", { pin: false });
       this.render();
     }
-  }
-
-  private formatRemainingMs(ms: number): string {
-    const secs = Math.max(0, Math.ceil(ms / 1000));
-    if (secs >= 60) {
-      const m = Math.floor(secs / 60);
-      const s = secs % 60;
-      return s > 0 ? `${m}分${s}秒` : `${m}分钟`;
-    }
-    return `${secs}秒`;
   }
 
   private get statusSummaryText(): string {
@@ -2759,11 +2020,7 @@ export class MenuMijiaWindowsApp {
     const sheetScrollTop = this.root.querySelector(".cc-sheet")?.scrollTop ?? 0;
 
     this.pendingCloudRender = false;
-    this.grokBall.prepareMove();
     this.renderNow();
-    const grokSlot = this.root.querySelector<HTMLElement>("[data-grok-slot]");
-    if (grokSlot) this.grokBall.mount(grokSlot, this.grokBall.element.dataset.emotion ?? "02");
-    this.syncGrokBallEmotion();
 
     const area = this.root.querySelector(".cc-scroll-area");
     if (area) area.scrollTop = scrollTop;
@@ -2827,9 +2084,7 @@ export class MenuMijiaWindowsApp {
         : null;
     const scheme = this.effectiveAppearance;
     this.root.dataset.scheme = scheme;
-    this.root.classList.toggle("is-grok-expanded", this.isGrokBallStageExpanded);
     this.root.classList.toggle("is-native-host", Boolean(window.__TAURI_INTERNALS__));
-    this.root.dataset.grokSide = this.grokBallOnLeft ? "left" : "right";
     const popoverClass = `cc-popover skin-${this.skin} scheme-${scheme} ${this.skin === "classic" ? "" : "is-skinned"} ${this.isEditingLayout ? "is-editing" : ""}`.trim();
     const innerContent = `
         <header class="cc-header">
@@ -2855,25 +2110,16 @@ export class MenuMijiaWindowsApp {
             </div>
 
             <div class="cc-header-controls">
-              <button
-                class="cc-circle-btn ${this.isListeningVoice ? "is-recording" : ""}"
-                id="btn-mic"
-                title="${t("语音控制")}"
-                aria-label="${t("语音控制")}"
-                aria-pressed="${this.isListeningVoice}"
-              >
-                ${SF_ICONS.micFill}
-              </button>
-              <button
-                class="cc-circle-btn ${this.isShowingAssistantBar ? "is-selected" : ""}"
-                id="btn-toggle-assistant"
-                title="${t("AI 自然语言指令栏 (/)")}"
-                aria-label="${t("AI 自然语言指令栏")}"
-                aria-pressed="${this.isShowingAssistantBar}"
-              >
-                ${SF_ICONS.sparkles}
-              </button>
               ${this.renderAllOffControl()}
+              <button
+                class="cc-circle-btn ${this.isDeviceSearchOpen ? "is-selected" : ""}"
+                id="btn-device-search"
+                title="${t("搜索设备或房间 (Ctrl+F)")}"
+                aria-label="${t("搜索设备或房间")}"
+                aria-expanded="${this.isDeviceSearchOpen}"
+              >
+                ${SF_ICONS.search}
+              </button>
               <button
                 class="cc-circle-btn"
                 id="btn-hide-panel"
@@ -2888,127 +2134,37 @@ export class MenuMijiaWindowsApp {
           ${this.renderEnvironmentStrip()}
         </header>
 
-        ${
-          this.isShowingAssistantBar
-            ? `
-          <section class="cc-assistant-section">
-            <div class="cc-spotlight-bar">
-              <span class="cc-spotlight-icon">${SF_ICONS.sparkles}</span>
-              <input
-                id="command-input"
-                class="cc-spotlight-input"
-                type="text"
-                placeholder="${t("说一句：我困了 / 调低两度 / 10分钟后关灯 / 撤销...")}"
-                aria-label="${t("自然语言指令")}"
-                ${this.isResolvingIntent ? "disabled" : ""}
-              />
-              <button
-                id="btn-send"
-                class="cc-spotlight-send"
-                title="${t("执行指令 (Enter)")}"
-                aria-label="${t("执行指令")}"
-                ${this.isResolvingIntent ? "disabled" : ""}
-              >
-                ${SF_ICONS.arrowUpCircle}
-              </button>
-            </div>
-
-            ${
-              this.replyBanner ||
-              this.scheduledCommands.length > 0 ||
-              this.missedScheduledCommands.length > 0 ||
-              activeUndo ||
-              this.pendingSuggestions.length > 0
-                ? `
-              <div class="cc-feedback-card ${this.replyBanner?.isError ? "is-error" : ""}">
-                ${
-                  this.replyBanner
-                    ? `
-                  <div class="cc-feedback-row">
-                    <span class="cc-feedback-badge">${this.escapeHtml(this.replyBanner.source)}</span>
-                    <span class="cc-feedback-text">${this.escapeHtml(this.replyBanner.text)}</span>
-                    ${
-                      this.pendingCloudConsent
-                        ? `<button class="cc-inline-pill" id="btn-cloud-allow">${t("允许并发送")}</button>
-                           <button class="cc-inline-pill" id="btn-cloud-decline">${t("不用了")}</button>`
-                        : ""
-                    }
-                    ${
-                      activeUndo
-                        ? `<button class="cc-inline-pill" id="btn-undo">${t("撤销")}</button>`
-                        : ""
-                    }
-                  </div>
-                `
-                    : ""
-                }
-                ${
-                  this.pendingSuggestions.length > 0
-                    ? `
-                  <div class="cc-suggestion-row">
-                    ${this.pendingSuggestions
-                      .map(
-                        (item) => `<button class="cc-inline-pill" data-suggestion-id="${this.escapeHtml(item.id)}">${this.escapeHtml(item.title)}${
-                          item.confidencePercent !== null ? ` · ${item.confidencePercent}%` : ""
-                        }</button>`,
-                      )
-                      .join("")}
-                  </div>
-                `
-                    : ""
-                }
-                ${
-                  this.missedScheduledCommands.length > 0
-                    ? `
-                  <div class="cc-timers-stack">
-                    ${this.missedScheduledCommands
-                      .map(
-                        (item) => `
-                      <div class="cc-timer-row">
-                        <span>${t("已错过定时：{command}（电脑睡眠时到点，没有自动执行）", { command: this.escapeHtml(item.command) })}</span>
-                        <button class="cc-inline-pill" data-run-missed="${item.id}">立即执行</button>
-                        <button class="cc-inline-pill" data-dismiss-missed="${item.id}">忽略</button>
-                      </div>
-                    `,
-                      )
-                      .join("")}
-                  </div>
-                `
-                    : ""
-                }
-                ${
-                  this.scheduledCommands.length > 0
-                    ? `
-                  <div class="cc-timers-stack">
-                    ${this.scheduledCommands
-                      .map(
-                        (item) => `
-                      <div class="cc-timer-row">
-                        <span>${this.escapeHtml(item.command)} ${t("· 剩余 {remaining}", { remaining: this.formatRemainingMs(item.fireTimestampMs - Date.now()) })}</span>
-                        <button class="cc-inline-pill" data-cancel-timer="${item.id}">取消</button>
-                      </div>
-                    `,
-                      )
-                      .join("")}
-                  </div>
-                `
-                    : ""
-                }
+        ${this.isDeviceSearchOpen || this.replyBanner || activeUndo ? `
+        <section class="cc-search-section">
+          ${this.isDeviceSearchOpen ? `
+          <div class="cc-spotlight-bar">
+            <span class="cc-spotlight-icon" aria-hidden="true">${SF_ICONS.search}</span>
+            <input
+              id="device-search"
+              class="cc-spotlight-input"
+              type="text"
+              value="${this.escapeHtml(this.deviceSearch)}"
+              placeholder="${t("搜索设备或房间 (Ctrl+F)")}"
+              aria-label="${t("搜索设备或房间")}"
+            />
+          </div>` : ""}
+          ${this.replyBanner || activeUndo ? `
+            <div class="cc-feedback-card ${this.replyBanner?.isError ? "is-error" : ""}" role="status">
+              <div class="cc-feedback-row">
+                ${this.replyBanner ? `
+                  <span class="cc-feedback-badge">${this.escapeHtml(this.replyBanner.source)}</span>
+                  <span class="cc-feedback-text">${this.escapeHtml(this.replyBanner.text)}</span>` : ""}
+                ${activeUndo ? `<button class="cc-inline-pill" id="btn-undo">${t("撤销")}</button>` : ""}
               </div>
-            `
-                : ""
-            }
-          </section>
-        `
-            : ""
-        }
+            </div>` : ""}
+        </section>` : ""}
 
         ${this.haConnectionError ? `<div class="cc-feedback-card is-error" role="alert" data-ha-error><span class="cc-feedback-badge">Home Assistant</span><span class="cc-feedback-text">${this.escapeHtml(this.haConnectionError)}</span></div>` : ""}
 
         <section class="cc-quick-strip">
           ${quickActions().map(
             (act) => `
-            <button class="cc-quick-pill tint-${act.tint}" data-scene-cmd="${this.escapeHtml(act.command)}">
+            <button class="cc-quick-pill tint-${act.tint}" data-quick-action="${act.id}">
               <span class="cc-quick-icon">${act.icon}</span>
               <span>${this.escapeHtml(act.title)}</span>
             </button>
@@ -3069,13 +2225,6 @@ export class MenuMijiaWindowsApp {
 
           <div class="cc-footer-actions">
             ${
-              this.availableUpdate
-                ? `<button class="cc-footer-pill is-accent" id="btn-footer-update" title="${t("发现新版本 v{version}", { version: this.availableUpdate.version })}">
-                    <span>${t("更新 v{version}", { version: this.availableUpdate.version })}</span>
-                  </button>`
-                : ""
-            }
-            ${
               this.settings.connectionMode !== "homeAssistant" && (!this.settings.miSession || isDemo)
                 ? `<button class="cc-footer-pill is-accent" id="btn-footer-qr" title="${t("用手机米家 App 扫码直连真实设备")}">
                     ${SF_ICONS.qrcode}
@@ -3102,7 +2251,7 @@ export class MenuMijiaWindowsApp {
             <button
               class="cc-footer-icon-btn"
               id="btn-settings"
-              title="${t("连接设置与 AI 决策配置")}"
+              title="${t("打开设置")}"
               aria-label="${t("打开设置")}"
             >
               ${SF_ICONS.sliderHorizontal}
@@ -3117,6 +2266,9 @@ export class MenuMijiaWindowsApp {
             </button>
           </div>
         </footer>
+        ${window.__TAURI_INTERNALS__ ? `
+          <div class="cc-panel-resize" id="panel-resize" title="${t("拖动左上角调整面板大小")}" aria-hidden="true"></div>
+        ` : ""}
 
         ${this.activeSheet === "onboarding" ? this.renderOnboardingModal() : ""}
         ${this.activeSheet === "settings" ? this.renderSettingsModal() : ""}
@@ -3134,8 +2286,6 @@ export class MenuMijiaWindowsApp {
     } else {
       this.root.innerHTML = `<div class="${popoverClass}">${innerContent}</div>`;
     }
-    this.root.querySelector(":scope > .cc-grok-sidebar")?.remove();
-    this.root.insertAdjacentHTML("beforeend", this.renderGrokBallSidebar());
 
     this.bindEvents();
   }
@@ -3173,6 +2323,10 @@ export class MenuMijiaWindowsApp {
   }
 
   private renderDeviceGrid(): string {
+    const devices = this.filteredDevices;
+    if (this.deviceSearch.trim() && devices.length === 0 && this.devices.length > 0) {
+      return `<div class="cc-empty-state" role="status">${t("找不到匹配的设备")}</div>`;
+    }
     if (this.settings.connectionMode === "homeAssistant" && this.devices.length === 0) return `<div class="cc-empty-state"><div class="cc-empty-title">Home Assistant</div><div class="cc-empty-subtitle">${this.isSyncingCloud ? "Connecting…" : "No connected devices. Check the saved URL, token and endpoint permission."}</div><button class="cc-btn-secondary" id="btn-empty-settings">Settings</button></div>`;
     if (this.settings.connectionMode === "xiaomiCloud" && this.devices.length === 0) {
       if (this.isSyncingCloud) {
@@ -3197,8 +2351,14 @@ export class MenuMijiaWindowsApp {
       `;
     }
 
+    if (devices.length === 0) {
+      return `<div class="cc-empty-state">
+        <div class="cc-empty-title">${t("当前没有可显示的设备")}</div>
+        <button class="cc-btn-secondary" id="btn-empty-settings">${t("打开设置")}</button>
+      </div>`;
+    }
     const isAll = this.selectedRoom === "全部";
-    const ordered = withAliases(this.layout, applyOrder(this.layout.order, this.filteredDevices));
+    const ordered = withAliases(this.layout, applyOrder(this.layout.order, devices));
     const sections = pageSections(this.layout, ordered, isAll);
     const bento = this.skin === "bento" && this.settings.isCompactGridMode;
     let index = 0;
@@ -3507,6 +2667,7 @@ export class MenuMijiaWindowsApp {
         <div class="cc-menu-sep"></div>
         <button class="cc-menu-item" data-rename-device="${id}">重命名…</button>
         <button class="cc-menu-item" data-start-editing>${t("编辑布局")}</button>
+        <button class="cc-menu-item" data-hide-device="${id}">${t("隐藏此设备")}</button>
       </div>`;
   }
 
@@ -4262,17 +3423,6 @@ export class MenuMijiaWindowsApp {
             }
           </div>
 
-          <div class="cc-field">
-            <label>${t("OpenRouter API Key（可选，用于 Jev SystemOne 模糊意图决策）")}</label>
-            <input
-              id="onboarding-api-key"
-              class="cc-input"
-              type="password"
-              placeholder="sk-or-v1-..."
-              value="${this.escapeHtml(this.apiKeyFor(this.settings.assistantBaseURL))}"
-            />
-          </div>
-
           <div class="cc-sheet-footer">
             <button class="cc-btn-secondary" id="btn-close-onboarding-alt">${t("先看演示预览")}</button>
             <button class="cc-btn-primary" id="btn-finish-onboarding">${t("进入控制中心")}</button>
@@ -4283,6 +3433,8 @@ export class MenuMijiaWindowsApp {
   }
 
   private renderSettingsModal(): string {
+    const hiddenIds = new Set(this.hiddenDeviceIds);
+    const hiddenDevices = withAliases(this.layout, this.devices.filter((device) => hiddenIds.has(device.id)));
     return `
       <div class="cc-sheet-backdrop">
         <div class="cc-sheet" role="dialog" aria-modal="true" aria-label="${t("偏好设置")}">
@@ -4292,8 +3444,6 @@ export class MenuMijiaWindowsApp {
               ${SF_ICONS.xmark}
             </button>
           </div>
-
-          ${this.availableUpdate ? this.renderUpdateSection() : ""}
 
           <div class="cc-field">
             <label>${t("外观模式")}</label>
@@ -4330,16 +3480,36 @@ export class MenuMijiaWindowsApp {
           </div>
 
           <div class="cc-field">
-            <label>${t("面板高度")}</label>
-            <div class="cc-segmented-pills">
-              ${PANEL_HEIGHTS.map((h) => `<button class="cc-seg-pill ${this.settings.panelHeight === h.id ? "is-active" : ""}" data-panel-height="${h.id}" aria-pressed="${this.settings.panelHeight === h.id}">${h.title}</button>`).join("")}
-            </div>
+            <label>${t("面板大小")}</label>
+            <p class="cc-field-hint">${t("拖动左上角调整面板大小")}</p>
+            <button type="button" class="cc-btn-secondary" id="btn-reset-panel-size">${t("恢复默认尺寸")}</button>
           </div>
 
           <div class="cc-field cc-field-row">
             <label for="settings-climate-panel">${t("空调使用整行控制条")}</label>
             <input id="settings-climate-panel" type="checkbox" ${this.settings.climatePanel ? "checked" : ""} />
           </div>
+
+          <div class="cc-field">
+            <label class="cc-checkbox">
+              <input type="checkbox" id="settings-hide-offline" ${this.layout.hideOfflineDevices === true ? "checked" : ""} />
+              <span>${t("隐藏离线设备")}</span>
+            </label>
+          </div>
+
+          ${hiddenDevices.length > 0 ? `
+            <div class="cc-field">
+              <label>${t("已隐藏的设备 ({count})", { count: hiddenDevices.length })}</label>
+              <div class="cc-timers-stack">
+                ${hiddenDevices.map((device) => `
+                  <div class="cc-field-row">
+                    <span>${this.escapeHtml(device.name)} · ${this.escapeHtml(device.roomName)}</span>
+                    <button class="cc-inline-pill" data-unhide-device="${this.escapeHtml(device.id)}">${t("恢复显示")}</button>
+                  </div>
+                `).join("")}
+              </div>
+            </div>
+          ` : ""}
 
           <div class="cc-field">
             <div class="cc-field-row">
@@ -4437,63 +3607,6 @@ export class MenuMijiaWindowsApp {
           </div>
 
           <div class="cc-field">
-            <label>${t("AI 服务商预设（支持 OpenRouter Jev、原生 Jev、DeepSeek、千问、GLM 等）")}</label>
-            <div class="cc-segmented-pills" style="flex-wrap: wrap;">
-              ${ASSISTANT_PROVIDER_PRESETS.filter((p) => p.id !== "custom")
-                .map((preset) => {
-                  const currentPreset = inferAssistantPreset(this.settings.assistantBaseURL);
-                  return `<button
-                    type="button"
-                    class="cc-seg-pill ${currentPreset.id === preset.id ? "is-active" : ""}"
-                    data-ai-preset="${this.escapeHtml(preset.id)}"
-                  >${this.escapeHtml(preset.shortTitle)}</button>`;
-                })
-                .join("")}
-            </div>
-          </div>
-
-          <div class="cc-field">
-            <label>${t("AI 服务地址（支持 /v1/systemone 与 OpenAI 兼容 /v1/chat/completions）")}</label>
-            <input
-              id="settings-base-url"
-              class="cc-input"
-              type="text"
-              placeholder="https://openrouter.ai/api/v1"
-              value="${this.escapeHtml(this.settings.assistantBaseURL)}"
-            />
-          </div>
-
-          <div class="cc-field">
-            <label>${t("决策模型（如 ~typesafe/jev-latest、jev-latest、deepseek-chat）")}</label>
-            <input
-              id="settings-model"
-              class="cc-input"
-              type="text"
-              value="${this.escapeHtml(this.settings.assistantModel)}"
-            />
-          </div>
-
-          <div class="cc-field">
-            <label>${t("API Key（本机安全保存）")}</label>
-            <input
-              id="settings-api-key"
-              class="cc-input"
-              type="password"
-              placeholder="${this.escapeHtml(inferAssistantPreset(this.settings.assistantBaseURL).keyPlaceholder)}"
-              value="${this.escapeHtml(this.apiKeyFor(this.settings.assistantBaseURL))}"
-            />
-          </div>
-
-          ${
-            this.settings.cloudConsentEndpoints.length > 0
-              ? `<div class="cc-field">
-            <label>${t("已允许发送到：{endpoints}", { endpoints: this.escapeHtml(this.settings.cloudConsentEndpoints.join("、")) })}</label>
-            <button type="button" class="cc-btn-secondary" id="btn-revoke-cloud">${t("撤销授权（下次发往云端前再问）")}</button>
-          </div>`
-              : ""
-          }
-
-          <div class="cc-field">
             <label>${t("「全关」包含哪些设备（插座、扫地机默认不包含）")}</label>
             <div class="cc-timers-stack">
               ${this.devices
@@ -4509,43 +3622,7 @@ export class MenuMijiaWindowsApp {
             </div>
           </div>
 
-          <div class="cc-field">
-            <label class="cc-checkbox">
-              <input type="checkbox" id="settings-habit" ${this.settings.habitLearningEnabled ? "checked" : ""} />
-              <span>${t("自动记住自然语言习惯（相同表达下次 0ms 本地直达）")}</span>
-            </label>
-            ${
-              this.settings.learnedShortcuts.length > 0
-                ? `<div class="cc-timers-stack">
-                    ${this.settings.learnedShortcuts
-                      .map(
-                        (s, idx) => `
-                      <div class="cc-timer-row">
-                        <span>「${this.escapeHtml(s.phrase)}」→ ${this.escapeHtml(s.reply)}</span>
-                        <button class="cc-inline-pill" data-del-habit="${idx}">删除</button>
-                      </div>
-                    `,
-                      )
-                      .join("")}
-                  </div>`
-                : ""
-            }
-            ${
-              this.settings.habitEntries.length > 0 || this.habitSequences().length > 0
-                ? `<div class="cc-timers-stack">
-                    <div class="cc-timer-row">
-                      <span>${t("已学习 {count} 条时段习惯、{sequences} 条先后习惯（用于猜你想控）", {
-                        count: this.settings.habitEntries.length,
-                        sequences: this.habitSequences().length,
-                      })}</span>
-                      <button class="cc-inline-pill" id="btn-clear-habits">${t("清空")}</button>
-                    </div>
-                  </div>`
-                : ""
-            }
-          </div>
-
-          ${!this.availableUpdate ? this.renderUpdateSection() : ""}
+          <p class="cc-field-hint">${t("Windows 自用版")} · v${APP_VERSION}</p>
 
           <div class="cc-sheet-footer">
             <button class="cc-btn-danger" id="btn-settings-quit">${t("退出 MenuBarMijia")}</button>
@@ -4556,85 +3633,37 @@ export class MenuMijiaWindowsApp {
     `;
   }
 
-  private renderUpdateSection(): string {
-    const release = this.availableUpdate;
-    const hasInstaller = Boolean(release?.installerAsset);
-    const notes = release?.notes?.trim() ?? "";
-    const statusText = this.updateStatusMessage?.text ?? (release && hasInstaller ? t("可直接下载并安装，无需打开浏览器") : "");
-    return `
-      <div class="cc-field cc-update-card ${release ? "is-available" : ""}">
-        <label>${release ? t("发现新版本 v{version}", { version: release.version }) : t("软件更新")}</label>
-        <div class="cc-update-row">
-          <span>${t("当前版本 v{version}", { version: APP_VERSION })}</span>
-          <div class="cc-update-actions">
-            ${
-              release
-                ? `${
-                    hasInstaller
-                      ? `<button type="button" class="cc-btn-primary" id="btn-install-update" ${this.isInstallingUpdate ? "disabled" : ""}>${this.isInstallingUpdate ? t("正在更新…") : t("立即更新")}</button>`
-                      : ""
-                  }
-                  <button type="button" class="cc-btn-secondary" id="btn-open-update">${
-                    hasInstaller ? t("手动下载") : t("有新版本 v{version}，点击查看", { version: release.version })
-                  }</button>`
-                : `<button type="button" class="cc-btn-secondary" id="btn-check-update" ${this.isCheckingUpdate ? "disabled" : ""}>${this.isCheckingUpdate ? t("检查中…") : t("立即检查")}</button>`
-            }
-          </div>
-        </div>
-        ${
-          statusText
-            ? `<div class="cc-update-status ${this.updateStatusMessage?.isError ? "is-error" : ""}">${this.escapeHtml(statusText)}</div>`
-            : ""
-        }
-        ${notes ? `<div class="cc-update-notes">${this.escapeHtml(notes)}</div>` : ""}
-        <label class="cc-checkbox" style="margin-top: 6px;">
-          <input type="checkbox" id="settings-auto-update" ${this.settings.autoCheckUpdates ? "checked" : ""} />
-          <span>${t("每天自动检查更新（关闭后不再请求 GitHub）")}</span>
-        </label>
-      </div>
-    `;
-  }
-
   private bindEvents(): void {
-    this.root.querySelectorAll<HTMLElement>("[data-grok-toggle]").forEach((button) => {
-      button.addEventListener("click", () => {
-        this.setGrokBallStageExpanded(!this.isGrokBallStageExpanded);
-      });
+    this.root.querySelector("#btn-device-search")?.addEventListener("click", () => {
+      this.setDeviceSearchOpen(!this.isDeviceSearchOpen);
     });
-    const inputEl = this.root.querySelector<HTMLInputElement>("#command-input");
-    const sendBtn = this.root.querySelector<HTMLButtonElement>("#btn-send");
-    const micBtn = this.root.querySelector<HTMLButtonElement>("#btn-mic");
-    const submitCommandInput = () => {
-      if (!inputEl) return;
-      const value = inputEl.value;
-      const restoreFocus = document.activeElement === inputEl;
-      inputEl.value = "";
-      void this.handleNaturalCommand(value).finally(() => {
-        if (!restoreFocus) return;
-        const active = document.activeElement;
-        if (active !== null && active !== inputEl && active !== document.body) return;
-        this.root.querySelector<HTMLInputElement>("#command-input")?.focus({ preventScroll: true });
-      });
-    };
+    const search = this.root.querySelector<HTMLInputElement>("#device-search");
+    search?.addEventListener("input", (event) => {
+      if (!(event as InputEvent).isComposing) this.setDeviceSearch(search.value);
+    });
+    search?.addEventListener("compositionend", () => this.setDeviceSearch(search.value));
 
-    inputEl?.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") {
-        submitCommandInput();
-      }
-    });
-    sendBtn?.addEventListener("click", () => {
-      submitCommandInput();
-    });
-    micBtn?.addEventListener("click", () => {
-      this.toggleVoiceInput();
+    this.root.querySelector<HTMLElement>("#panel-resize")?.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      this.panelResize = {
+        pointerId: event.pointerId,
+        startX: event.screenX,
+        startY: event.screenY,
+        startWidth: window.innerWidth,
+        startHeight: window.innerHeight,
+        width: window.innerWidth,
+        height: window.innerHeight,
+        moved: false,
+      };
+      this.root.setPointerCapture?.(event.pointerId);
+      invokeTauriVoid("set_pin_popover", { pin: true });
     });
 
-    this.root.querySelector("#btn-toggle-assistant")?.addEventListener("click", () => {
-      this.isShowingAssistantBar = !this.isShowingAssistantBar;
-      this.render();
-      if (this.isShowingAssistantBar) {
-        this.root.querySelector<HTMLInputElement>("#command-input")?.focus();
-      }
+    this.root.querySelector("#btn-reset-panel-size")?.addEventListener("click", () => {
+      this.settings.panelSize = DEFAULT_PANEL_SIZE;
+      writeSettingsForStorage(this.settings);
+      this.applyPanelSize();
     });
 
     this.bindAllOffControl();
@@ -4704,6 +3733,17 @@ export class MenuMijiaWindowsApp {
     this.root.querySelectorAll<HTMLElement>("[data-rename-device]").forEach((btn) => {
       btn.addEventListener("click", () => this.openPrompt({ kind: "renameDevice", deviceId: btn.dataset.renameDevice ?? "" }));
     });
+    this.root.querySelectorAll<HTMLElement>("[data-hide-device], [data-unhide-device]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const id = button.dataset.hideDevice ?? button.dataset.unhideDevice;
+        if (id) this.setDeviceHidden(id, button.dataset.hideDevice !== undefined);
+      });
+    });
+    this.root.querySelector<HTMLInputElement>("#settings-hide-offline")?.addEventListener("change", (event) => {
+      this.layout.hideOfflineDevices = (event.currentTarget as HTMLInputElement).checked;
+      this.saveLayout();
+      this.render();
+    });
     this.root.querySelector("[data-start-editing]")?.addEventListener("click", () => {
       this.ctxMenu = null;
       this.startEditing();
@@ -4765,7 +3805,6 @@ export class MenuMijiaWindowsApp {
           dev,
           { kind: "setClimateTemperature", entityId: k.entityId, temperature },
           t("已将{name}设为 {temp}", { name: dev.name, temp: formatTemperature(temperature) }),
-          { targetId: dev.id, operation: { kind: "targetTemperature", celsius: temperature } },
         );
       });
     });
@@ -4780,7 +3819,6 @@ export class MenuMijiaWindowsApp {
           dev,
           { kind: "setClimateFanMode", entityId: dev.kind.entityId, fanMode },
           t("已将{name}风速设为 {speed}", { name: dev.name, speed: localizeFanMode(fanMode) }),
-          { targetId: dev.id, operation: { kind: "fanSpeed", speed: fanMode } },
         );
       });
     });
@@ -4828,14 +3866,6 @@ export class MenuMijiaWindowsApp {
       });
     });
 
-    this.root.querySelectorAll<HTMLElement>("[data-panel-height]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        this.settings.panelHeight = btn.dataset.panelHeight as PanelHeight;
-        this.saveSettings();
-        this.applyPanelHeight();
-        this.render();
-      });
-    });
     this.root.querySelector<HTMLInputElement>("#settings-climate-panel")?.addEventListener("change", (e) => {
       this.settings.climatePanel = (e.target as HTMLInputElement).checked;
       this.saveSettings();
@@ -4919,45 +3949,15 @@ export class MenuMijiaWindowsApp {
       void this.performUndo();
     });
 
-    this.root.querySelectorAll<HTMLElement>("[data-suggestion-id]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const suggestion = this.pendingSuggestions.find((s) => s.id === btn.dataset.suggestionId);
-        if (!suggestion) return;
-        this.pendingSuggestions = this.pendingSuggestions.filter((s) => s.id !== suggestion.id);
-        const aliasedDevices = withAliases(this.layout, this.devices);
-        const intents = IntentValidator.sanitize(suggestion.intents, aliasedDevices, this.scenes);
-        void this.executeIntents(intents, IntentReply.describe(intents, aliasedDevices, this.scenes), t("已确认"), { recordHabits: true });
-      });
-    });
-
-    this.root.querySelectorAll<HTMLElement>("[data-run-missed]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const item = this.missedScheduledCommands.find((c) => c.id === btn.dataset.runMissed);
-        if (!item) return;
-        this.missedScheduledCommands = this.missedScheduledCommands.filter((c) => c.id !== item.id);
-        void this.handleNaturalCommand(item.command, true);
-      });
-    });
-
-    this.root.querySelectorAll<HTMLElement>("[data-dismiss-missed]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        this.missedScheduledCommands = this.missedScheduledCommands.filter((c) => c.id !== btn.dataset.dismissMissed);
-        this.render();
-      });
-    });
-
-    this.root.querySelectorAll<HTMLElement>("[data-cancel-timer]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const id = btn.dataset.cancelTimer;
-        this.scheduledCommands = this.scheduledCommands.filter((c) => c.id !== id);
-        this.render();
-      });
-    });
-
-    this.root.querySelectorAll<HTMLElement>("[data-scene-cmd]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const cmd = btn.dataset.sceneCmd;
-        if (cmd) void this.handleNaturalCommand(cmd);
+    this.root.querySelectorAll<HTMLElement>("[data-quick-action]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const action = quickActions().find((item) => item.id === button.dataset.quickAction);
+        if (!action) return;
+        const intents = this.roomDevices
+          .filter((device) => device.isOnline && device.kind.kind === action.deviceKind)
+          .filter((device) => device.kind.kind !== "climate" || device.kind.availableModes.includes("cool"))
+          .flatMap((device) => action.operations.map((operation) => ({ targetId: device.id, operation })));
+        void this.executeIntents(intents, action.title, t("快捷动作"));
       });
     });
 
@@ -4966,20 +3966,7 @@ export class MenuMijiaWindowsApp {
         const scene = this.scenes.find((item) => item.id === button.dataset.haScene);
         if (!scene) return;
         const intents: DeviceIntent[] = [{targetId:scene.id,operation:{kind:"activateScene"}}];
-        void this.executeIntents(intents, IntentReply.describe(intents, this.devices, this.scenes), t("0ms 本地直达"), {recordHabits:true});
-      });
-    });
-
-    this.root.querySelectorAll<HTMLElement>("[data-proactive-id]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const suggestion = this.currentProactiveSuggestions().find((s) => s.id === btn.dataset.proactiveId);
-        if (!suggestion) return;
-        const aliasedDevices = withAliases(this.layout, this.devices);
-        const intents = IntentValidator.sanitize(suggestion.intents, aliasedDevices, this.scenes);
-        if (intents.length === 0) return;
-        this.isShowingAssistantBar = true;
-        this.setGrokBallStageExpanded(false);
-        void this.executeIntents(intents, IntentReply.describe(intents, aliasedDevices, this.scenes), t("猜你想控"), { recordHabits: true });
+        void this.executeIntents(intents, IntentReply.describe(intents, this.devices, this.scenes), t("场景"));
       });
     });
 
@@ -5008,7 +3995,6 @@ export class MenuMijiaWindowsApp {
           dev,
           firstCmd,
           `已${nextOn ? t("打开") : t("关闭")}${dev.name}`,
-          { targetId: dev.id, operation: { kind: "power", isOn: nextOn } },
         );
       }
     };
@@ -5060,7 +4046,6 @@ export class MenuMijiaWindowsApp {
           dev,
           { kind: "setLightEffect", entityId: dev.kind.entityId, effect },
           t("已切换{name}灯光模式", { name: dev.name }),
-          { targetId: dev.id, operation: { kind: "lightEffect", effect } },
         );
       });
     });
@@ -5076,7 +4061,6 @@ export class MenuMijiaWindowsApp {
           dev,
           { kind: "setLightBrightness", entityId: dev.kind.entityId, percent },
           t("已将{name}亮度设为 {percent}%", { name: dev.name, percent: percent }),
-          { targetId: dev.id, operation: { kind: "brightness", percent } },
         );
       });
     });
@@ -5092,7 +4076,6 @@ export class MenuMijiaWindowsApp {
           dev,
           { kind: "setLightColorTemp", entityId: dev.kind.entityId, kelvin },
           t("已将{name}色温设为 {kelvin}K", { name: dev.name, kelvin: kelvin }),
-          { targetId: dev.id, operation: { kind: "colorTemperature", kelvin } },
         );
       });
     });
@@ -5109,7 +4092,6 @@ export class MenuMijiaWindowsApp {
           dev,
           { kind: "setClimateTemperature", entityId: dev.kind.entityId, temperature },
           t("已将{name}设为 {temp}", { name: dev.name, temp: formatTemperature(temperature) }),
-          { targetId: dev.id, operation: { kind: "targetTemperature", celsius: temperature } },
         );
       });
     });
@@ -5126,7 +4108,6 @@ export class MenuMijiaWindowsApp {
           dev,
           { kind: "setClimateMode", entityId: dev.kind.entityId, hvacMode },
           t("已切换{name}模式", { name: dev.name }),
-          { targetId: dev.id, operation: { kind: "hvacMode", mode: hvacMode } },
         );
       });
     });
@@ -5143,7 +4124,6 @@ export class MenuMijiaWindowsApp {
           dev,
           { kind: "setFanPresetMode", entityId: dev.kind.entityId, presetMode },
           t("已将{name}设为 {speed}", { name: dev.name, speed: IntentReply.fanSpeedLabel(presetMode) }),
-          { targetId: dev.id, operation: { kind: "fanSpeed", speed: presetMode } },
         );
       });
     });
@@ -5174,7 +4154,6 @@ export class MenuMijiaWindowsApp {
           dev,
           { kind: "setFanOscillating", entityId: dev.kind.entityId, oscillating: nextOsc },
           `已${nextOsc ? t("开启") : t("关闭")}${dev.name}摇头`,
-          { targetId: dev.id, operation: { kind: "oscillation", enabled: nextOsc } },
         );
       });
     });
@@ -5265,23 +4244,6 @@ export class MenuMijiaWindowsApp {
       this.render();
     });
 
-    this.root.querySelector("#btn-cloud-allow")?.addEventListener("click", () => {
-      const pending = this.pendingCloudConsent;
-      if (!pending) return;
-      this.pendingCloudConsent = null;
-      if (!this.settings.cloudConsentEndpoints.includes(pending.endpoint)) {
-        this.settings.cloudConsentEndpoints.push(pending.endpoint);
-        this.saveSettings(true);
-      }
-      void this.handleNaturalCommand(pending.utterance, true);
-    });
-
-    this.root.querySelector("#btn-cloud-decline")?.addEventListener("click", () => {
-      this.pendingCloudConsent = null;
-      this.replyBanner = { text: t("没有发送。「打开书房灯」这类简单指令不用联网。"), source: t("已取消") };
-      this.render();
-    });
-
     this.root.querySelectorAll<HTMLInputElement>("[data-alloff-device]").forEach((box) => {
       box.addEventListener("change", () => {
         const id = box.dataset.alloffDevice ?? "";
@@ -5297,12 +4259,6 @@ export class MenuMijiaWindowsApp {
       });
     });
 
-    this.root.querySelector("#btn-revoke-cloud")?.addEventListener("click", () => {
-      this.settings.cloudConsentEndpoints = [];
-      this.saveSettings();
-      this.render();
-    });
-
     this.root.querySelectorAll<HTMLSelectElement>("[data-mi-region]").forEach((select) => {
       select.addEventListener("change", () => {
         this.settings.miCloudRegion = normalizeMiCloudRegion(select.value);
@@ -5311,38 +4267,11 @@ export class MenuMijiaWindowsApp {
       });
     });
 
-    this.root.querySelector<HTMLInputElement>("#settings-auto-update")?.addEventListener("change", (event) => {
-      this.settings.autoCheckUpdates = (event.target as HTMLInputElement).checked;
-      this.saveSettings();
-      this.render();
-    });
-
-    this.root.querySelector("#btn-check-update")?.addEventListener("click", () => {
-      void this.checkForAppUpdate(true);
-    });
-
-    this.root.querySelector("#btn-install-update")?.addEventListener("click", () => {
-      void this.startUpdateInstall();
-    });
-
-    this.root.querySelector("#btn-open-update")?.addEventListener("click", () => {
-      this.openUpdatePage();
-    });
-
-    this.root.querySelector("#btn-footer-update")?.addEventListener("click", () => {
-      this.openSettingsSheet();
-    });
-
     this.root.querySelector("#btn-start-qr")?.addEventListener("click", () => {
       void this.startXiaomiQRLogin();
     });
 
     const closeOnboarding = () => {
-      const keyInput = this.root.querySelector<HTMLInputElement>("#onboarding-api-key");
-      if (keyInput && keyInput.value.trim()) {
-        this.settings.openRouterApiKey = keyInput.value.trim();
-        this.settings.assistantKeyEndpoint = assistantEndpointIdentity(this.settings.assistantBaseURL);
-      }
       this.settings.hasCompletedOnboarding = true;
       this.saveSettings();
       this.activeSheet = "none";
@@ -5397,57 +4326,7 @@ export class MenuMijiaWindowsApp {
       });
     });
 
-    this.root.querySelectorAll<HTMLElement>("[data-del-habit]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const idx = Number(btn.dataset.delHabit);
-        if (!Number.isNaN(idx)) {
-          this.settings.learnedShortcuts.splice(idx, 1);
-          this.saveSettings();
-          this.render();
-        }
-      });
-    });
-
-    this.root.querySelector("#btn-clear-habits")?.addEventListener("click", () => {
-      this.settings.habitEntries = [];
-      localStorage.removeItem("menumijia.windows.habit.sequences.v1");
-      this.aiProactiveSuggestions = null;
-      this.aiProactiveSignature = null;
-      this.saveSettings();
-      this.render();
-    });
-
-    this.root.querySelectorAll<HTMLElement>("[data-ai-preset]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const presetId = btn.dataset.aiPreset;
-        const preset = ASSISTANT_PROVIDER_PRESETS.find((p) => p.id === presetId);
-        if (!preset || !preset.defaultBaseURL) return;
-        const baseEl = this.root.querySelector<HTMLInputElement>("#settings-base-url");
-        const modelEl = this.root.querySelector<HTMLInputElement>("#settings-model");
-        const apiKeyEl = this.root.querySelector<HTMLInputElement>("#settings-api-key");
-        if (baseEl) baseEl.value = preset.defaultBaseURL;
-        if (modelEl) modelEl.value = preset.defaultModel;
-        if (apiKeyEl) {
-          apiKeyEl.placeholder = preset.keyPlaceholder;
-          this.syncKeyFieldWithEndpoint(apiKeyEl, preset.defaultBaseURL);
-        }
-        this.root.querySelectorAll<HTMLElement>("[data-ai-preset]").forEach((el) => {
-          el.classList.toggle("is-active", el.dataset.aiPreset === preset.id);
-        });
-      });
-    });
-
-    this.root.querySelector<HTMLInputElement>("#settings-base-url")?.addEventListener("input", (event) => {
-      const apiKeyEl = this.root.querySelector<HTMLInputElement>("#settings-api-key");
-      const target = event.target as HTMLInputElement;
-      if (apiKeyEl) this.syncKeyFieldWithEndpoint(apiKeyEl, target.value);
-    });
-
     this.root.querySelector("#btn-save-settings")?.addEventListener("click", () => {
-      const baseEl = this.root.querySelector<HTMLInputElement>("#settings-base-url");
-      const apiKeyEl = this.root.querySelector<HTMLInputElement>("#settings-api-key");
-      const modelEl = this.root.querySelector<HTMLInputElement>("#settings-model");
-      const habitEl = this.root.querySelector<HTMLInputElement>("#settings-habit");
       const haUrl = this.root.querySelector<HTMLInputElement>("#settings-ha-url");
       const haToken = this.root.querySelector<HTMLInputElement>("#settings-ha-token");
       if (haUrl) {
@@ -5474,15 +4353,6 @@ export class MenuMijiaWindowsApp {
         }
         this.settings.haToken = token;
       }
-      if (baseEl) this.settings.assistantBaseURL = baseEl.value.trim() || "https://openrouter.ai/api/v1";
-      if (apiKeyEl) this.settings.openRouterApiKey = apiKeyEl.value.trim();
-      this.settings.assistantKeyEndpoint = this.settings.openRouterApiKey
-        ? assistantEndpointIdentity(this.settings.assistantBaseURL)
-        : null;
-      const inferredPreset = inferAssistantPreset(this.settings.assistantBaseURL);
-      const fallbackModel = inferredPreset.defaultModel || "gpt-4o-mini";
-      if (modelEl) this.settings.assistantModel = modelEl.value.trim() || fallbackModel;
-      if (habitEl) this.settings.habitLearningEnabled = habitEl.checked;
       this.saveSettings(true);
       if (this.settings.connectionMode === "homeAssistant") void this.refreshHADevices();
       this.activeSheet = "none";
@@ -5795,7 +4665,7 @@ export class MenuMijiaWindowsApp {
         const percent = this.dimPreview.percent;
         this.dimPreview = null;
         if (dev && dev.kind.kind === "light") {
-          void this.executeSingleCommand(dev, { kind: "setLightBrightness", entityId: dev.kind.entityId, percent }, t("已将{name}亮度设为 {percent}%", { name: dev.name, percent: percent }), { targetId: dev.id, operation: { kind: "brightness", percent } });
+          void this.executeSingleCommand(dev, { kind: "setLightBrightness", entityId: dev.kind.entityId, percent }, t("已将{name}亮度设为 {percent}%", { name: dev.name, percent: percent }));
         }
       }
     });
@@ -5829,7 +4699,6 @@ export class MenuMijiaWindowsApp {
   /** Drop-in animation each time the tray popover is shown. */
   private bindOpenAnimation(): void {
     const play = () => {
-      this.applyPanelHeight();
       this.root.classList.remove("is-opening");
       void this.root.offsetWidth;
       this.root.classList.add("is-opening");
@@ -5859,38 +4728,53 @@ export class MenuMijiaWindowsApp {
     play();
   }
 
-  private applyPanelHeight(): void {
-    const invoke = window.__TAURI_INTERNALS__?.invoke;
-    if (!invoke) return;
-    this.panelGeometryUpdates = this.panelGeometryUpdates.then(async () => {
-      const h = PANEL_HEIGHTS.find((item) => item.id === this.settings.panelHeight) ?? PANEL_HEIGHTS[1]!;
-      const side = await invoke<boolean>("set_panel_height", {
-        height: h.px, expanded: this.isGrokBallStageExpanded, sideLeft: this.grokBallOnLeft,
+  private applyPanelSize(): void {
+    const legacyHeight = PANEL_HEIGHTS.find((item) => item.id === this.settings.panelHeight)?.px;
+    const size = this.settings.panelSize ?? { width: DEFAULT_PANEL_SIZE.width, height: legacyHeight ?? DEFAULT_PANEL_SIZE.height };
+    invokeTauriVoid("set_panel_size", { ...size, apply: true });
+  }
+
+  private bindPanelResize(): void {
+    this.root.addEventListener("pointermove", (event) => {
+      const resize = this.panelResize;
+      if (!resize || resize.pointerId !== event.pointerId) return;
+      resize.width = resize.startWidth + resize.startX - event.screenX;
+      resize.height = resize.startHeight + resize.startY - event.screenY;
+      resize.moved ||= resize.width !== resize.startWidth || resize.height !== resize.startHeight;
+      if (!resize.moved) return;
+      if (this.resizeFrame !== undefined) return;
+      this.resizeFrame = window.requestAnimationFrame(() => {
+        this.resizeFrame = undefined;
+        if (this.panelResize === resize) invokeTauriVoid("resize_panel", { width: resize.width, height: resize.height });
       });
-      if (typeof side === "boolean") {
-        this.grokBallOnLeft = side;
-        this.root.dataset.grokSide = side ? "left" : "right";
-      }
-    }).catch((error: unknown) => console.error("Panel geometry update failed", error));
+    });
+    const finish = (event: PointerEvent) => {
+      const resize = this.panelResize;
+      if (!resize || resize.pointerId !== event.pointerId) return;
+      this.panelResize = null;
+      if (this.resizeFrame !== undefined) window.cancelAnimationFrame(this.resizeFrame);
+      this.resizeFrame = undefined;
+      void this.saveResizedPanel(resize);
+    };
+    this.root.addEventListener("pointerup", finish);
+    this.root.addEventListener("pointercancel", finish);
+    this.root.addEventListener("lostpointercapture", finish);
   }
 
-  /** The saved API key, only when it was saved for this server (#19). */
-  private apiKeyFor(baseURL: string): string {
-    const key = this.settings.openRouterApiKey.trim();
-    if (!key) return "";
-    const identity = assistantEndpointIdentity(baseURL);
-    return identity !== null && identity === this.settings.assistantKeyEndpoint ? key : "";
-  }
-
-  /** Pointing the address at another server clears the saved key from the form; switching back restores it. */
-  private syncKeyFieldWithEndpoint(apiKeyEl: HTMLInputElement, baseURL: string): void {
-    const savedKey = this.settings.openRouterApiKey.trim();
-    if (!savedKey) return;
-    const belongs = this.apiKeyFor(baseURL) !== "";
-    if (!belongs && apiKeyEl.value.trim() === savedKey) {
-      apiKeyEl.value = "";
-    } else if (belongs && apiKeyEl.value.trim() === "") {
-      apiKeyEl.value = savedKey;
+  private async saveResizedPanel(resize: NonNullable<MenuMijiaWindowsApp["panelResize"]>): Promise<void> {
+    try {
+      if (!resize.moved) return;
+      const invoke = window.__TAURI_INTERNALS__?.invoke;
+      const fitted = await invoke?.<[number, number]>("resize_panel", { width: resize.width, height: resize.height });
+      const size = storedPanelSize(fitted && { width: fitted[0], height: fitted[1] });
+      if (!size) return;
+      this.settings.panelSize = size;
+      writeSettingsForStorage(this.settings);
+      await invoke?.("set_panel_size", { ...size, apply: false });
+    } catch (error) {
+      console.error("Panel resize failed", error);
+    } finally {
+      if (this.panelResize === null) invokeTauriVoid("set_pin_popover", { pin: false });
     }
   }
 

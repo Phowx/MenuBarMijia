@@ -1,4 +1,3 @@
-import { EventEmitter, once } from "node:events";
 import { readFileSync } from "node:fs";
 import { HomeAssistantSynthesizer, homeAssistantIdentity } from "../src/core/homeAssistant.js";
 import assert from "node:assert/strict";
@@ -8,6 +7,7 @@ import { Window } from "happy-dom";
 
 import { installWindow } from "./dom.js";
 import { MenuMijiaWindowsApp } from "../src/ui/app.js";
+import type { DeviceIntent } from "../src/core/models.js";
 import { cloudFixture } from "./cloudFixture.js";
 import { MiCloudClient, MiotSynthesizer } from "../src/core/miCloudClient.js";
 import { MiCloudCrypto } from "../src/core/miCloudCrypto.js";
@@ -49,11 +49,25 @@ async function setRange(selector: string, value: string): Promise<void> {
   await setImmediate();
 }
 
-async function command(text: string): Promise<void> {
-  const input = document.querySelector<HTMLInputElement>("#command-input");
-  assert.ok(input);
-  input.value = text;
-  await click("#btn-send");
+function openSearch(): HTMLInputElement {
+  if (!document.querySelector("#device-search")) element("#btn-device-search").click();
+  return element("#device-search") as HTMLInputElement;
+}
+
+function searchFor(query: string): HTMLInputElement {
+  const search = openSearch();
+  search.focus();
+  search.value = query;
+  search.dispatchEvent(new Event("input", { bubbles: true }));
+  return element("#device-search") as HTMLInputElement;
+}
+
+// Exercise ordered multi-attribute plans that the current panel cannot compose.
+function runStructuredActions(app: MenuMijiaWindowsApp, intents: readonly DeviceIntent[]): Promise<boolean> {
+  const executor = app as unknown as {
+    executeIntents(intents: readonly DeviceIntent[], summary: string, source: string): Promise<boolean>;
+  };
+  return executor.executeIntents(intents, "测试操作", "测试");
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
@@ -87,9 +101,7 @@ beforeEach(() => {
   Object.defineProperty(dom.navigator, "languages", { value: ["zh-CN", "zh"], configurable: true });
   Object.defineProperty(dom.navigator, "language", { value: "zh-CN", configurable: true });
   document.body.innerHTML = '<div id="app"></div>';
-  // Most UI tests do not exercise the daily GitHub check; mark it done today so the
-  // startup request cannot change their request lists (#39). Update tests clear this.
-  localStorage.setItem("menumijia.windows.update.v1", JSON.stringify({ lastCheckedAtMs: Date.now(), release: null }));
+
 });
 
 afterEach(async () => {
@@ -98,7 +110,7 @@ afterEach(async () => {
 });
 
 describe("Service endpoint submission", () => {
-  it("sends the saved assistant and Home Assistant URLs and not a free origin list", async () => {
+  it("submits only the Home Assistant URL and ignores the legacy AI endpoint", async () => {
     const calls: Array<{ command: string; args: Record<string, unknown> }> = [];
     const invoke = async (command: string, args: Record<string, unknown> = {}) => {
       calls.push({ command, args });
@@ -116,7 +128,7 @@ describe("Service endpoint submission", () => {
     await setImmediate();
 
     assert.deepEqual(calls.filter((call) => call.command === "set_service_endpoints").map((call) => call.args), [
-      { assistantUrl: "HTTPS://API.DeepSeek.com:8443/v1", haUrl: "http://[::1]:8123/api" },
+      { haUrl: "http://[::1]:8123/api" },
     ]);
     assert.equal(calls.some((call) => call.command === "set_allowed_origins"), false);
   });
@@ -156,37 +168,59 @@ describe("Service endpoint submission", () => {
 });
 
 describe("Windows device control and undo", () => {
-  it("keeps focus in the command input after a local command completes", async () => {
+  it("finds devices by name, room, full pinyin and initials without executing input", async () => {
     startDemo();
-    const input = element("#command-input") as HTMLInputElement;
-    input.value = "客厅吸顶灯月光模式";
-    input.focus();
-
-    await click("#btn-send");
-    await waitFor(() => tile("light.living_ceiling").includes("月光"));
-
-    assert.ok(
-      document.activeElement === element("#command-input"),
-      "command input lost keyboard focus after a local command",
-    );
+    assert.equal(document.querySelector(".cc-search-section"), null);
+    assert.equal(element("#btn-device-search").getAttribute("aria-expanded"), "false");
+    window.dispatchEvent(new dom.KeyboardEvent("keydown", { key: "f", ctrlKey: true }) as unknown as Event);
+    assert.equal(document.activeElement, element("#device-search"));
+    assert.match(tile("light.living_ceiling"), /已开启/);
+    for (const query of ["客厅", "keting", "kt", "xidingdeng", "xdd"]) {
+      const search = searchFor(query);
+      assert.equal(document.activeElement, search);
+      assert.equal(search.value, query);
+      assert.match(tile("light.living_ceiling"), /客厅吸顶灯/);
+      assert.equal(document.querySelector('[data-tile-id="fan.bedroom_standing"]'), null);
+    }
+    const search = searchFor("关闭所有灯");
+    search.dispatchEvent(new dom.KeyboardEvent("keydown", { key: "Enter", bubbles: true }) as unknown as Event);
+    assert.match(textOf(".cc-scroll-area"), /找不到匹配的设备/);
+    search.dispatchEvent(new dom.KeyboardEvent("keydown", { key: "Escape", bubbles: true }) as unknown as Event);
+    assert.equal(document.querySelector("#device-search"), null);
+    assert.equal(document.activeElement, element("#btn-device-search"));
+    assert.equal(openSearch().value, "");
+    assert.match(tile("light.living_ceiling"), /已开启/);
   });
 
-  it("clears a submitted command after undo instead of restoring it into the input", async () => {
+  it("hides a device from cards, search and quick actions and restores it from Settings", async () => {
     startDemo();
-    await click('[data-toggle-device="light.living_ceiling"]');
-    const input = element("#command-input") as HTMLInputElement;
-    input.value = "撤销";
-    input.focus();
+    await click('[data-room="客厅"]');
+    const card = '[data-tile-id="light.living_ceiling"]';
+    element(card).dispatchEvent(new dom.MouseEvent("contextmenu", { bubbles: true }) as unknown as Event);
+    await click('[data-hide-device="light.living_ceiling"]');
+    assert.equal(document.querySelector(card), null);
+    const saved = JSON.parse(localStorage.getItem("menumijia.windows.settings.v2") ?? "{}");
+    assert.deepEqual(saved.layout.hiddenDeviceIds.demo, ["light.living_ceiling"]);
+    searchFor("xdd");
+    assert.match(textOf(".cc-scroll-area"), /找不到匹配的设备/);
+    await click("#btn-device-search");
+    await click('[data-quick-action="lights_off"]');
+    assert.equal(document.querySelector("#btn-undo"), null);
 
-    await click("#btn-send");
-
+    await click("#btn-settings");
+    assert.match(textOf(".cc-sheet"), /已隐藏的设备 \(1\)/);
+    await click('[data-unhide-device="light.living_ceiling"]');
+    await click("#btn-close-settings");
     assert.match(tile("light.living_ceiling"), /已开启/);
-    assert.equal(input.value, "");
-    assert.equal(document.querySelector<HTMLInputElement>("#command-input")?.value, "");
-    assert.ok(
-      document.activeElement === document.querySelector("#command-input"),
-      "command input lost keyboard focus after submission",
-    );
+  });
+
+  it("runs a structured quick action and undoes it using the panel button", async () => {
+    startDemo();
+    await click('[data-room="客厅"]');
+    await click('[data-quick-action="lights_off"]');
+    assert.match(tile("light.living_ceiling"), /已关闭/);
+    await click("#btn-undo");
+    assert.match(tile("light.living_ceiling"), /已开启/);
   });
 
   it("restores an originally off light without turning it on through brightness", async () => {
@@ -209,19 +243,11 @@ describe("Windows device control and undo", () => {
     assert.match(tile("light.living_ceiling"), /78% · 4100K/);
   });
 
-  it("restores a light effect through the natural command flow", async () => {
-    startDemo();
-    await command("客厅吸顶灯月光模式");
-    assert.match(tile("light.living_ceiling"), /月光/);
-    await click("#btn-undo");
-    assert.match(tile("light.living_ceiling"), /日光/);
-  });
-
   it("restores ordinary color temperature after a light-effect action", async () => {
     startDemo();
     await click('[data-expand-device="light.living_ceiling"]');
     await setRange('[data-colortemp="light.living_ceiling"]', "5500");
-    await command("客厅吸顶灯月光模式");
+    await click('[data-lighteffect="light.living_ceiling"][data-effect="Night"]');
     assert.match(tile("light.living_ceiling"), /月光/);
     await click("#btn-undo");
     assert.match(tile("light.living_ceiling"), /5500K/);
@@ -265,14 +291,14 @@ describe("Windows device control and undo", () => {
   });
 
   it("undoes only acknowledged attributes when another command on the same device fails", async () => {
-    const cloud = cloudFixture([
+    const cloud = cloudFixture([]);
+    const app = new MenuMijiaWindowsApp(element("#app"));
+    await setImmediate();
+    assert.match(tile("fixture-light"), /50% · 4100K/);
+    await runStructuredActions(app, [
       { targetId: "fixture-light", operation: { kind: "brightness", percent: 80 } },
       { targetId: "fixture-light", operation: { kind: "colorTemperature", kelvin: 5500 } },
     ]);
-    new MenuMijiaWindowsApp(element("#app"));
-    await setImmediate();
-    assert.match(tile("fixture-light"), /50% · 4100K/);
-    await command("部分失败");
     assert.match(document.body.textContent ?? "", /1 项失败/);
     assert.match(tile("fixture-light"), /50% · 5500K/);
     cloud.values.set(2, 90);
@@ -286,14 +312,14 @@ describe("Windows device control and undo", () => {
   });
 
   it("reverses multiple acknowledged changes to the same attribute in execution order", async () => {
-    const cloud = cloudFixture([
+    const cloud = cloudFixture([]);
+    cloud.allowBrightness();
+    const app = new MenuMijiaWindowsApp(element("#app"));
+    await setImmediate();
+    await runStructuredActions(app, [
       { targetId: "fixture-light", operation: { kind: "brightness", percent: 80 } },
       { targetId: "fixture-light", operation: { kind: "brightness", percent: 60 } },
     ]);
-    cloud.allowBrightness();
-    new MenuMijiaWindowsApp(element("#app"));
-    await setImmediate();
-    await command("部分失败");
     assert.match(tile("fixture-light"), /60%/);
     await click("#btn-undo");
     assert.match(tile("fixture-light"), /50%/);
@@ -363,6 +389,33 @@ describe("Silent Xiaomi cloud refresh (#81)", { concurrency: false }, () => {
       },
     };
   }
+
+  it("keeps successful sync in the footer and clears a sync error after recovery", async () => {
+    const { cloud } = await readyCloudApp();
+    assert.match(textOf(".cc-footer-label"), /1 台设备/);
+    assert.equal(document.querySelector(".cc-search-section"), null);
+    cloud.setDeviceListFailure(true);
+    await click("#btn-refresh");
+    await waitFor(() => !!document.querySelector(".cc-feedback-card.is-error"));
+    assert.match(textOf(".cc-feedback-text"), /米家云同步失败/);
+    cloud.setDeviceListFailure(false);
+    await click("#btn-refresh");
+    await waitFor(() => !document.querySelector(".cc-search-section"));
+  });
+
+  it("reapplies the offline visibility setting when polling changes connectivity", async () => {
+    const { cloud, triggerRefresh } = await readyCloudApp();
+    await click("#btn-settings");
+    await click("#settings-hide-offline");
+    await click("#btn-close-settings");
+    cloud.deviceRecords[0]!.isOnline = false;
+    triggerRefresh();
+    await waitFor(() => !document.querySelector('[data-tile-id="fixture-light"]'));
+    assert.match(textOf(".cc-scroll-area"), /当前没有可显示的设备/);
+    cloud.deviceRecords[0]!.isOnline = true;
+    triggerRefresh();
+    await waitFor(() => !!document.querySelector('[data-tile-id="fixture-light"]'));
+  });
 
   it("keeps device and room positions when cloud polling permutes the same records", async () => {
     const { cloud, triggerRefresh } = await readyCloudApp((fixture) => {
@@ -462,7 +515,7 @@ describe("Silent Xiaomi cloud refresh (#81)", { concurrency: false }, () => {
 
   it("keeps the current DOM when polling returns the same snapshot", async () => {
     const { cloud, triggerRefresh } = await readyCloudApp();
-    const input = element("#command-input") as HTMLInputElement;
+    const input = openSearch();
     const popover = element(".cc-popover");
     input.value = "未发送的草稿";
     input.focus();
@@ -475,14 +528,14 @@ describe("Silent Xiaomi cloud refresh (#81)", { concurrency: false }, () => {
     await setImmediate();
 
     assert.equal(element(".cc-popover"), popover);
-    assert.equal(element("#command-input"), input);
+    assert.equal(element("#device-search"), input);
     assert.equal(document.activeElement, input);
     assert.equal(input.value, "未发送的草稿");
   });
 
-  it("patches a real state change without disturbing the command draft", async () => {
+  it("patches a real state change without disturbing the search draft", async () => {
     const { cloud, triggerRefresh } = await readyCloudApp();
-    const input = element("#command-input") as HTMLInputElement;
+    const input = openSearch();
     const inputNode = input;
     input.value = "未发送的草稿";
     input.focus();
@@ -491,8 +544,8 @@ describe("Silent Xiaomi cloud refresh (#81)", { concurrency: false }, () => {
     triggerRefresh();
     await waitFor(() => tile("fixture-light").includes("90%"));
     assert.match(tile("fixture-light"), /90%/);
-    assert.ok(element("#command-input") === inputNode, "command input was replaced");
-    assert.ok(document.activeElement === inputNode, "command focus moved");
+    assert.ok(element("#device-search") === inputNode, "search input was replaced");
+    assert.ok(document.activeElement === inputNode, "search focus moved");
     assert.equal(input.value, "未发送的草稿");
   });
 
@@ -673,157 +726,6 @@ describe("Credentials move out of localStorage (#28)", () => {
   });
 });
 
-describe("AI key stays with the server it was saved for (#19)", () => {
-  function keyField(): HTMLInputElement {
-    return element("#settings-api-key") as HTMLInputElement;
-  }
-
-  it("does not carry the saved key to another provider, and restores it when switching back", async () => {
-    localStorage.setItem("menumijia.windows.settings.v2", JSON.stringify({
-      connectionMode: "demo",
-      hasCompletedOnboarding: true,
-      assistantBaseURL: "https://openrouter.ai/api/v1",
-      openRouterApiKey: "sk-or-saved",
-    }));
-    new MenuMijiaWindowsApp(element("#app"));
-    await click("#btn-settings");
-    assert.equal(keyField().value, "sk-or-saved");
-
-    await click('[data-ai-preset="deepseek"]');
-    assert.equal(keyField().value, "");
-
-    await click('[data-ai-preset="openrouter_jev"]');
-    assert.equal(keyField().value, "sk-or-saved");
-
-    const base = element("#settings-base-url") as HTMLInputElement;
-    base.value = "https://openrouter.ai.evil.com/api/v1";
-    base.dispatchEvent(new Event("input", { bubbles: true }));
-    assert.equal(keyField().value, "");
-  });
-
-  it("never sends a key that was saved for a different server", async () => {
-    localStorage.setItem("menumijia.windows.settings.v2", JSON.stringify({
-      connectionMode: "demo",
-      hasCompletedOnboarding: true,
-      assistantBaseURL: "https://my-proxy.example.com/v1",
-      openRouterApiKey: "sk-saved-for-openrouter",
-      assistantKeyEndpoint: "openrouter.ai",
-    }));
-    new MenuMijiaWindowsApp(element("#app"));
-    await command("帮我想想今晚怎么安排灯光氛围");
-    assert.match(document.body.textContent ?? "", /未命中本地规则。请在设置中填写 AI 服务的 API Key/);
-  });
-});
-
-describe("First cloud AI request asks once (#20)", () => {
-  function fakeModel(): string[] {
-    const urls: string[] = [];
-    const content = JSON.stringify({ actions: [], reply: "已经很合适了" });
-    const invoke = async (name: string, args: Record<string, unknown> = {}) => {
-      if (name !== "native_http") return undefined;
-      urls.push(String(args.url));
-      return { status: 200, headers: {}, body: JSON.stringify({ choices: [{ message: { content } }] }) };
-    };
-    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: { invoke }, configurable: true });
-    localStorage.setItem("menumijia.windows.settings.v2", JSON.stringify({
-      connectionMode: "demo",
-      hasCompletedOnboarding: true,
-      assistantBaseURL: "https://api.deepseek.com/v1",
-      assistantModel: "deepseek-chat",
-      openRouterApiKey: "sk-deepseek",
-      assistantKeyEndpoint: "api.deepseek.com",
-    }));
-    return urls;
-  }
-
-  it("sends nothing until allowed, then remembers the service", async () => {
-    const urls = fakeModel();
-    new MenuMijiaWindowsApp(element("#app"));
-    await command("帮我想想今晚怎么安排灯光氛围");
-    assert.match(document.body.textContent ?? "", /要交给云端 AI（api\.deepseek\.com）处理吗/);
-    assert.equal(urls.length, 0);
-
-    await click("#btn-cloud-allow");
-    await setImmediate();
-    assert.deepEqual(urls, ["https://api.deepseek.com/v1/chat/completions"]);
-    const saved = JSON.parse(localStorage.getItem("menumijia.windows.settings.v2") ?? "{}") as { cloudConsentEndpoints?: string[] };
-    assert.deepEqual(saved.cloudConsentEndpoints, ["api.deepseek.com"]);
-
-    await command("帮我想想今晚怎么安排灯光氛围");
-    assert.equal(urls.length, 2);
-    assert.equal(document.querySelector("#btn-cloud-allow"), null);
-  });
-
-  it("declining sends nothing", async () => {
-    const urls = fakeModel();
-    new MenuMijiaWindowsApp(element("#app"));
-    await command("帮我想想今晚怎么安排灯光氛围");
-    await click("#btn-cloud-decline");
-    assert.match(document.body.textContent ?? "", /没有发送/);
-    assert.equal(urls.length, 0);
-  });
-});
-
-describe("AI suggestions wait for a tap (#21)", () => {
-  it("shows a chip for an unsure guess and runs it only when tapped", async () => {
-    const answers = {
-      target: { choice: "d3", confidence: 0.9 },
-      op: { choice: "power_off", confidence: 0.55 },
-      temp: { choice: "none", confidence: 0.99 },
-    };
-    const invoke = async (name: string) => {
-      if (name !== "native_http") return undefined;
-      return { status: 200, headers: {}, body: JSON.stringify({ answers }) };
-    };
-    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: { invoke }, configurable: true });
-    localStorage.setItem("menumijia.windows.settings.v2", JSON.stringify({
-      connectionMode: "demo",
-      hasCompletedOnboarding: true,
-      assistantBaseURL: "https://openrouter.ai/api/v1",
-      assistantModel: "~typesafe/jev-latest",
-      openRouterApiKey: "sk-or-test",
-      assistantKeyEndpoint: "openrouter.ai",
-      cloudConsentEndpoints: ["openrouter.ai"],
-    }));
-    new MenuMijiaWindowsApp(element("#app"));
-    const before = tile("light.study_desk");
-    await command("帮我想想今晚怎么安排灯光氛围");
-    await setImmediate();
-    assert.match(document.body.textContent ?? "", /没把握直接执行，点下面的建议再执行/);
-    assert.equal(tile("light.study_desk"), before);
-
-    const chip = element("[data-suggestion-id]");
-    assert.match(chip.textContent ?? "", /关闭书房台灯 · 55%/);
-    chip.click();
-    await setImmediate();
-    await setImmediate();
-    assert.equal(document.querySelector("[data-suggestion-id]"), null);
-    assert.match(tile("light.study_desk"), /已关闭/);
-  });
-});
-
-describe("Timers the PC slept through (#22)", () => {
-  it("holds an overdue timer until 立即执行 is tapped", async () => {
-    startDemo();
-    const before = tile("light.study_desk");
-    await command("10分钟后关闭书房台灯");
-    assert.match(document.body.textContent ?? "", /已设定 10 分钟后执行「关闭书房台灯」/);
-    const realNow = Date.now;
-    Date.now = () => realNow() + 3 * 3600 * 1000;
-    try {
-      await new Promise((resolve) => setTimeout(resolve, 1_200));
-      assert.match(document.body.textContent ?? "", /已错过定时：关闭书房台灯/);
-      assert.equal(tile("light.study_desk"), before);
-      await click("[data-run-missed]");
-      await setImmediate();
-      assert.match(tile("light.study_desk"), /已关闭/);
-      assert.equal(document.querySelector("[data-run-missed]"), null);
-    } finally {
-      Date.now = realNow;
-    }
-  });
-});
-
 describe("全关 (#23)", () => {
   it("needs a hold in the classic skin and leaves the plug on", async () => {
     startDemo();
@@ -870,119 +772,68 @@ describe("Xiaomi cloud region switch (#37)", () => {
   });
 });
 
-describe("Update notice (#39)", () => {
-  it("shows a newer release in settings and hands it to the tray", async () => {
-    localStorage.removeItem("menumijia.windows.update.v1");
-    const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
-    const releaseBody = JSON.stringify({
-      tag_name: "v9.9.9",
-      html_url: "https://github.com/jryang1997/MenuBarMijia/releases/tag/v9.9.9",
-    });
-    const invoke = async (name: string, args: Record<string, unknown> = {}): Promise<unknown> => {
-      calls.push({ name, args });
-      if (name === "native_http" && String(args["url"]).startsWith("https://api.github.com/")) {
-        return { status: 200, headers: {}, body: releaseBody };
-      }
+describe("Windows personal edition", () => {
+  it("starts with legacy assistant and updater preferences without contacting either service", async () => {
+    const commands: string[] = [];
+    const invoke = async (name: string) => {
+      commands.push(name);
       return undefined;
     };
     Object.defineProperty(window, "__TAURI_INTERNALS__", { value: { invoke }, configurable: true });
     localStorage.setItem("menumijia.windows.settings.v2", JSON.stringify({
       connectionMode: "demo",
       hasCompletedOnboarding: true,
+      autoCheckUpdates: true,
+      assistantBaseURL: "https://api.deepseek.com/v1",
+      learnedShortcuts: [{ phrase: "关闭所有灯" }],
     }));
-
     new MenuMijiaWindowsApp(element("#app"));
-    await setImmediate();
-    await setImmediate();
-
-    const trayCall = calls.find((call) => call.name === "set_update_available");
-    assert.deepEqual(trayCall?.args, { version: "9.9.9" });
-    const saved = JSON.parse(localStorage.getItem("menumijia.windows.update.v1") ?? "{}") as {
-      release?: { version?: string };
-    };
-    assert.equal(saved.release?.version, "9.9.9");
-
+    searchFor("关闭所有灯");
     await click("#btn-settings");
-    assert.match(document.body.textContent ?? "", /有新版本 v9\.9\.9，点击查看/);
-    await click("#btn-open-update");
-    const openCall = calls.find((call) => call.name === "open_release_page");
-    assert.deepEqual(openCall?.args, {
-      url: "https://github.com/jryang1997/MenuBarMijia/releases/tag/v9.9.9",
-    });
+    for (const selector of ["#btn-mic", "#btn-grok-ball", "#command-input", "#settings-base-url", "#settings-auto-update", "#btn-install-update"]) {
+      assert.equal(document.querySelector(selector), null);
+    }
+    assert.equal(commands.includes("native_http"), false);
+    assert.equal(commands.includes("set_update_available"), false);
+    assert.equal(commands.includes("install_update"), false);
   });
 
-  it("installs an update directly in-app when a verified installer asset is present", async () => {
-    localStorage.removeItem("menumijia.windows.update.v1");
-    const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
-    const sha = "b".repeat(64);
-    const releaseBody = JSON.stringify({
-      tag_name: "v9.9.9",
-      html_url: "https://github.com/jryang1997/MenuBarMijia/releases/tag/v9.9.9",
-      body: "新增应用内直接更新",
-      assets: [
-        {
-          name: "MenuBarMijia-9.9.9-windows-x64-setup.exe",
-          browser_download_url:
-            "https://github.com/jryang1997/MenuBarMijia/releases/download/v9.9.9/MenuBarMijia-9.9.9-windows-x64-setup.exe",
-          size: 3145728,
-          digest: `sha256:${sha}`,
-        },
-      ],
-    });
-    const invoke = async (name: string, args: Record<string, unknown> = {}): Promise<unknown> => {
-      calls.push({ name, args });
-      if (name === "native_http" && String(args["url"]).startsWith("https://api.github.com/")) {
-        return { status: 200, headers: {}, body: releaseBody };
+  it("resizes the native panel from a drag and persists the resulting logical dimensions", async () => {
+    const sizes: Array<Record<string, unknown>> = [];
+    const dragSizes: Array<Record<string, unknown>> = [];
+    const invoke = async (name: string, args: Record<string, unknown> = {}) => {
+      if (name === "set_panel_size") sizes.push(args);
+      if (name === "resize_panel") {
+        dragSizes.push(args);
+        return [args.width, args.height];
       }
       return undefined;
     };
     Object.defineProperty(window, "__TAURI_INTERNALS__", { value: { invoke }, configurable: true });
     localStorage.setItem("menumijia.windows.settings.v2", JSON.stringify({
-      connectionMode: "demo",
-      hasCompletedOnboarding: true,
+      connectionMode: "demo", hasCompletedOnboarding: true, panelHeight: "tall",
     }));
-
-    new MenuMijiaWindowsApp(element("#app"));
-    await setImmediate();
-    await setImmediate();
-
-    await click("#btn-footer-update");
-    assert.match(document.body.textContent ?? "", /发现新版本 v9\.9\.9/);
-    assert.match(document.body.textContent ?? "", /新增应用内直接更新/);
-    await click("#btn-install-update");
-    const installCall = calls.find((call) => call.name === "install_update");
-    assert.deepEqual(installCall?.args, {
-      asset: {
-        name: "MenuBarMijia-9.9.9-windows-x64-setup.exe",
-        downloadURL:
-          "https://github.com/jryang1997/MenuBarMijia/releases/download/v9.9.9/MenuBarMijia-9.9.9-windows-x64-setup.exe",
-        sizeBytes: 3145728,
-        sha256: sha,
-        checksumURL: null,
-        signatureURL:
-          "https://github.com/jryang1997/MenuBarMijia/releases/download/v9.9.9/MenuBarMijia-9.9.9-windows-x64-setup.exe.ed25519.sig",
-      },
+    Object.defineProperties(window, {
+      innerWidth: { value: 480, configurable: true },
+      innerHeight: { value: 740, configurable: true },
     });
-  });
-
-  it("makes no request when automatic checks are switched off", async () => {
-    localStorage.removeItem("menumijia.windows.update.v1");
-    const urls: string[] = [];
-    const invoke = async (name: string, args: Record<string, unknown> = {}): Promise<unknown> => {
-      if (name === "native_http") urls.push(String(args["url"]));
-      return undefined;
+    const root = element("#app");
+    new MenuMijiaWindowsApp(root);
+    assert.deepEqual(sizes, [{ width: 480, height: 740, apply: true }]);
+    const drag = (type: string, target: HTMLElement, screenX: number, screenY: number) => {
+      target.dispatchEvent(new dom.PointerEvent(type, { button: 0, pointerId: 1, screenX, screenY, bubbles: true }) as unknown as Event);
     };
-    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: { invoke }, configurable: true });
-    localStorage.setItem("menumijia.windows.settings.v2", JSON.stringify({
-      connectionMode: "demo",
-      hasCompletedOnboarding: true,
-      autoCheckUpdates: false,
-    }));
-
-    new MenuMijiaWindowsApp(element("#app"));
-    await setImmediate();
-    await setImmediate();
-    assert.deepEqual(urls, []);
+    drag("pointerdown", element("#panel-resize"), 500, 600);
+    drag("pointermove", root, 410, 660);
+    drag("pointerup", root, 410, 660);
+    await waitFor(() => sizes.length === 2);
+    assert.deepEqual(dragSizes.at(-1), { width: 570, height: 680 });
+    assert.deepEqual(sizes[1], { width: 570, height: 680, apply: false });
+    const saved = JSON.parse(localStorage.getItem("menumijia.windows.settings.v2") ?? "{}");
+    assert.deepEqual(saved.panelSize, { width: 570, height: 680 });
+    await click("#btn-settings");
+    await click("#btn-reset-panel-size");
+    assert.deepEqual(sizes[2], { width: 480, height: 620, apply: true });
   });
 });
 
@@ -1632,107 +1483,6 @@ describe("Air purifier support (#98)", () => {
   });
 });
 
-describe("Manual habit learning and proactive Top-4 (#113)", () => {
-  const settingsKey = "menumijia.windows.settings.v2";
-
-  function habitEntries(): Array<{ bucket: string; targetId: string; operationKey: string; count: number }> {
-    const parsed = JSON.parse(localStorage.getItem(settingsKey) ?? "{}") as { habitEntries?: Array<{ bucket: string; targetId: string; operationKey: string; count: number }> };
-    return parsed.habitEntries ?? [];
-  }
-
-  it("records a time-bucket habit for a manual card toggle and rolls it back on undo", async () => {
-    startDemo();
-    await click('[data-toggle-device="light.living_ceiling"]');
-
-    const entries = habitEntries();
-    assert.equal(entries.length, 1);
-    assert.equal(entries[0]?.targetId, "light.living_ceiling");
-    assert.equal(entries[0]?.operationKey, "power:off");
-    assert.equal(entries[0]?.count, 1);
-    assert.match(entries[0]?.bucket ?? "", /^(清晨|午间|下午|夜晚|深夜)$/);
-
-    await click("#btn-undo");
-    assert.equal(habitEntries().length, 0);
-  });
-
-  it("records every committed slider gesture with its final value", async () => {
-    startDemo();
-    await click('[data-expand-device="light.living_ceiling"]');
-    await setRange('[data-brightness="light.living_ceiling"]', "30");
-    await setRange('[data-brightness="light.living_ceiling"]', "42");
-
-    // Each `change` event is one committed gesture on Windows, so each trains one habit.
-    assert.deepEqual(habitEntries().map((e) => e.operationKey), ["brightness:30", "brightness:42"]);
-  });
-
-  it("shows four zero-delay proactive suggestions when opening the ball", async () => {
-    startDemo();
-    await click("#btn-grok-ball");
-    // Demo home: two lights on (全屋关灯), then running AC, plug, and camera power-offs.
-    const pills = [...document.querySelectorAll<HTMLElement>("[data-proactive-id]")];
-    assert.equal(pills.length, 4);
-    assert.match(pills[0]?.textContent ?? "", /全屋关灯/);
-  });
-
-  it("executes a proactive suggestion and records it as a habit", async () => {
-    startDemo();
-    await click("#btn-grok-ball");
-    await click('[data-proactive-id^="builtin:lightsOff"]');
-    await waitFor(() => habitEntries().length > 0);
-    assert.ok(habitEntries().every((e) => e.operationKey === "power:off"));
-    // Reopening filters out the completed action because the lights are now off.
-    await waitFor(() => document.querySelector(".cc-grok-stage") === null);
-    await click("#btn-grok-ball");
-    assert.equal(document.querySelector('[data-proactive-id^="builtin:lightsOff"]'), null);
-  });
-
-  it("records a scene quick action through the natural command flow", async () => {
-    startDemo();
-    await click('[data-scene-cmd="关闭所有灯"]');
-    await waitFor(() => habitEntries().length > 0);
-
-    const entries = habitEntries();
-    assert.ok(entries.length >= 1);
-    assert.ok(entries.every((e) => e.operationKey === "power:off"));
-    assert.ok(entries.some((e) => e.targetId === "light.living_ceiling"));
-
-    await click("#btn-undo");
-    assert.equal(habitEntries().length, 0);
-  });
-
-  it("learns nothing when habit learning is disabled", async () => {
-    localStorage.setItem(settingsKey, JSON.stringify({
-      connectionMode: "demo",
-      hasCompletedOnboarding: true,
-      habitLearningEnabled: false,
-    }));
-    new MenuMijiaWindowsApp(element("#app"));
-    await click('[data-toggle-device="light.living_ceiling"]');
-    await click('[data-scene-cmd="关闭所有灯"]');
-    await setImmediate();
-    assert.equal(habitEntries().length, 0);
-  });
-});
-
-describe("Scene habit learning (#113 review fix)", () => {
-  const settingsKey = "menumijia.windows.settings.v2";
-
-  function habitEntries(): Array<{ targetId: string; operationKey: string; count: number }> {
-    const parsed = JSON.parse(localStorage.getItem(settingsKey) ?? "{}") as { habitEntries?: Array<{ targetId: string; operationKey: string; count: number }> };
-    return parsed.habitEntries ?? [];
-  }
-
-  it("executes a typed scene command and records its habit", async () => {
-    startDemo();
-    await command("执行回家模式");
-    await waitFor(() => habitEntries().length > 0);
-
-    const entries = habitEntries();
-    assert.deepEqual(entries.map((e) => [e.targetId, e.operationKey]), [["scene.home", "scene:activate"]]);
-    assert.match(document.body.textContent ?? "", /已执行回家模式/);
-  });
-});
-
 describe("Home Assistant source", () => {
   const fixture = JSON.parse(readFileSync("../Tests/Fixtures/ha_snapshot.json", "utf8"));
   function startHA(failedSnapshot = false, cached = failedSnapshot, token = "controlled-token"): { calls: string[]; failCommand: () => void } {
@@ -1773,9 +1523,9 @@ describe("Home Assistant source", () => {
     new MenuMijiaWindowsApp(element("#app"));
     await waitFor(() => !!document.querySelector('[data-body-device="study-light"]'));
     await click('[data-expand-device="study-light"]');
+    const searchInput = openSearch();
     const card = element('[data-tile-id="study-light"]');
     const input = element('[data-brightness="study-light"]');
-    const commandInput = element("#command-input");
     const scroll = element(".cc-scroll-area");
     const order = [...document.querySelectorAll<HTMLElement>("[data-tile-id]")].map((node) => node.dataset.tileId);
     scroll.scrollTop = 57;
@@ -1788,7 +1538,7 @@ describe("Home Assistant source", () => {
       await waitFor(() => snapshots === before + 1);
       assert.ok(element('[data-tile-id="study-light"]') === card, "Remote power must preserve the card node");
       assert.ok(element('[data-brightness="study-light"]') === input, "Remote power must preserve the slider node");
-      assert.ok(element("#command-input") === commandInput);
+      assert.ok(element("#device-search") === searchInput);
       assert.ok(document.activeElement === input, "The focused slider must stay focused");
       assert.ok(element(".cc-scroll-area") === scroll);
       assert.equal(scroll.scrollTop, 57);
@@ -1822,10 +1572,10 @@ describe("Home Assistant source", () => {
     localStorage.setItem("menumijia.windows.settings.v2", JSON.stringify({ connectionMode: "homeAssistant", haBaseURL: "http://localhost:8123", hasCompletedOnboarding: true }));
     new MenuMijiaWindowsApp(element("#app"));
     await waitFor(() => !!document.querySelector('[data-tile-id="heat-only"]'));
+    const searchInput = openSearch();
     const card = element('[data-tile-id="heat-only"]');
     const power = element('.cc-climate-power[data-toggle-device="heat-only"]');
     const step = element('[data-acstep="heat-only:1"]');
-    const commandInput = element("#command-input");
     const scroll = element(".cc-scroll-area");
     scroll.scrollTop = 41;
     step.focus();
@@ -1835,7 +1585,7 @@ describe("Home Assistant source", () => {
       assert.ok(element('[data-tile-id="heat-only"]') === card, "A mode value change must preserve the thermostat card");
       assert.ok(element('.cc-climate-power[data-toggle-device="heat-only"]') === power);
       assert.ok(element('[data-acstep="heat-only:1"]') === step);
-      assert.ok(element("#command-input") === commandInput);
+      assert.ok(element("#device-search") === searchInput);
       assert.ok(document.activeElement === step);
       assert.ok(element(".cc-scroll-area") === scroll);
       assert.equal(scroll.scrollTop, 41);
@@ -1862,128 +1612,6 @@ describe("Home Assistant source", () => {
     for (const key of keys) assert.equal(localStorage.getItem(key)?.includes("camera_proxy"), false);
     assert.deepEqual(credentialWrites, [], "An expiring camera URL does not belong in the credential vault");
   });
-  for (const responseState of ["cached", "pending"]) {
-    it(`isolates ${responseState} proactive recommendations across matching HA entity IDs`, async () => {
-      const responses = new EventEmitter();
-      const ticks: Array<() => void> = [];
-      let modelRequests = 0;
-      let oldResponseReturned = false;
-      Object.defineProperty(window, "setInterval", { value: (handler: () => void) => { ticks.push(handler); return ticks.length; }, configurable: true });
-      const invoke = async (name: string, args: Record<string, unknown> = {}) => {
-        if (name === "secure_store_get") return args.name === "ha_token" ? "controlled-token" : null;
-        if (name === "ha_snapshot") {
-          const source = String(args.baseUrl).endsWith("8124") ? "B" : "A";
-          return { areas: [], devices: [], entities: [], states: [{ entity_id: "light.study", state: "on", attributes: { friendly_name: `Source ${source} lamp` } }] };
-        }
-        if (name === "native_http") {
-          const request = ++modelRequests;
-          if (request === 1 && responseState === "pending") await once(responses, "old");
-          if (request === 2) await once(responses, "current");
-          if (request === 1) oldResponseReturned = true;
-          const content = JSON.stringify({ suggestions: [{ device: "d1", op: "power", value: false, confidence: 0.9 }] });
-          return { status: 200, headers: {}, body: JSON.stringify({ choices: [{ message: { content } }] }) };
-        }
-        return undefined;
-      };
-      Object.defineProperty(window, "__TAURI_INTERNALS__", { value: { invoke }, configurable: true });
-      localStorage.setItem("menumijia.windows.settings.v2", JSON.stringify({ connectionMode: "homeAssistant", haBaseURL: "http://localhost:8123", hasCompletedOnboarding: true, assistantBaseURL: "http://localhost:1234/v1", assistantModel: "controlled-model" }));
-      new MenuMijiaWindowsApp(element("#app"));
-      await waitFor(() => !!document.querySelector('[data-tile-id="light.study"]'));
-      await click("#btn-grok-ball");
-      for (const tick of ticks) tick();
-      await waitFor(() => modelRequests === 1);
-      if (responseState === "cached") await waitFor(() => !!document.querySelector('[data-proactive-id^="chat:"]'));
-      await click("#btn-settings");
-      const url = document.querySelector<HTMLInputElement>("#settings-ha-url");
-      assert.ok(url);
-      url.value = "http://localhost:8124";
-      await click("#btn-save-settings");
-      await waitFor(() => tile("light.study").includes("Source B lamp"));
-      if (!document.querySelector(".cc-grok-stage")) await click("#btn-grok-ball");
-      assert.doesNotMatch(document.body.textContent ?? "", /Source A lamp/);
-      for (const tick of ticks) tick();
-      await setImmediate();
-      assert.equal(modelRequests, 2, "The new source must start its own recommendation request");
-      if (responseState === "pending") {
-        responses.emit("old");
-        await waitFor(() => oldResponseReturned);
-        await setImmediate();
-        assert.doesNotMatch(document.body.textContent ?? "", /Source A lamp/);
-        for (const tick of ticks) tick();
-        assert.equal(modelRequests, 2, "A stale completion must not unlock the current in-flight request");
-      }
-      responses.emit("current");
-      await waitFor(() => !!document.querySelector('[data-proactive-id^="chat:"]'));
-      assert.match(textOf('[data-proactive-id^="chat:"]'), /Source B lamp/);
-      assert.doesNotMatch(document.body.textContent ?? "", /Source A lamp/);
-    });
-  }
-  for (const outcome of ["action", "suggestion", "error", "same-source", "same-source-suggestion", "same-source-error"] as const) {
-    it(`binds a held model ${outcome} to its initiating HA source`, async () => {
-      const modelResponse = new EventEmitter();
-      let modelStarted = false;
-      let modelReturned = false;
-      const calls: Array<Record<string, unknown>> = [];
-      const invoke = async (name: string, args: Record<string, unknown> = {}) => {
-        if (name === "secure_store_get") return args.name === "ha_token" ? "account-a" : null;
-        if (name === "ha_snapshot") {
-          const snapshot = structuredClone(fixture);
-          snapshot.states.push({ entity_id: "camera.front", state: "idle", attributes: { friendly_name: "Front camera" } });
-          return snapshot;
-        }
-        if (name === "ha_execute") calls.push(args);
-        if (name === "native_http") {
-          if (!String(args.body).includes("让这里适合观星")) return { status: 200, headers: {}, body: JSON.stringify({ choices: [{ message: { content: '{"suggestions":[]}' } }] }) };
-          modelStarted = true;
-          await once(modelResponse, "release");
-          modelReturned = true;
-          if (outcome.endsWith("error")) throw new Error("Late account A error");
-          const content = JSON.stringify({ actions: [{ device: outcome.endsWith("suggestion") ? "camera.front" : "d1", op: "power", value: false }], reply: "Account A model reply" });
-          return { status: 200, headers: {}, body: JSON.stringify({ choices: [{ message: { content } }] }) };
-        }
-        return undefined;
-      };
-      Object.defineProperty(window, "__TAURI_INTERNALS__", { value: { invoke }, configurable: true });
-      localStorage.setItem("menumijia.windows.settings.v2", JSON.stringify({ connectionMode: "homeAssistant", haBaseURL: "http://localhost:8123", hasCompletedOnboarding: true, assistantBaseURL: "http://localhost:1234/v1", assistantModel: "controlled-model" }));
-      new MenuMijiaWindowsApp(element("#app"));
-      await waitFor(() => !!document.querySelector('[data-body-device="study-light"]'));
-      await command("让这里适合观星");
-      await waitFor(() => modelStarted);
-      if (!outcome.startsWith("same-source")) {
-        await click("#btn-settings");
-        const url = document.querySelector<HTMLInputElement>("#settings-ha-url");
-        assert.ok(url);
-        url.value = "http://localhost:8124";
-        await click("#btn-save-settings");
-        await waitFor(() => !!document.querySelector('[data-body-device="study-light"]'));
-      }
-      const before = localStorage.getItem("menumijia.windows.settings.v2");
-      const bannerBefore = document.querySelector(".cc-feedback-text")?.textContent;
-      modelResponse.emit("release");
-      await waitFor(() => modelReturned);
-      await setImmediate();
-      if (outcome === "same-source") {
-        assert.equal(calls.length, 1);
-        assert.match(tile("study-light"), /已关闭/);
-        assert.ok(document.querySelector("#btn-undo"));
-        const saved = JSON.parse(localStorage.getItem("menumijia.windows.settings.v2") ?? "{}");
-        assert.equal(saved.learnedShortcuts.length, 1);
-      } else if (outcome === "same-source-suggestion") {
-        assert.equal(calls.length, 0);
-        assert.ok(document.querySelector("[data-suggestion-id]"), "A current model suggestion must remain available");
-      } else if (outcome === "same-source-error") {
-        assert.equal(calls.length, 0);
-        assert.match(textOf(".cc-feedback-text"), /Late account A error/);
-      } else {
-        assert.equal(calls.length, 0, "An account A model response must never control account B's matching entity ID");
-        assert.ok(!document.querySelector("#btn-undo"), "A stale response must not install undo");
-        assert.ok(!document.querySelector("[data-suggestion-id]"), "A stale response must not publish suggestions");
-        assert.equal(localStorage.getItem("menumijia.windows.settings.v2"), before, "Late replies must not save learning or habit receipts");
-        assert.equal(document.querySelector(".cc-feedback-text")?.textContent, bannerBefore);
-        assert.doesNotMatch(document.body.textContent ?? "", /Account A model reply|Late account A error/);
-      }
-    });
-  }
   it("uses heat-only capability for card power and same-source undo", async () => {
     const snapshot = JSON.parse(readFileSync("../Tests/Fixtures/ha_regressions.json", "utf8"));
     const modes: unknown[] = [];
@@ -2023,14 +1651,12 @@ describe("Home Assistant source", () => {
     localStorage.setItem("menumijia.windows.settings.v2", JSON.stringify({ connectionMode: "homeAssistant", haBaseURL: "http://localhost:8123", hasCompletedOnboarding: true, cachedHAHome: { identity: homeAssistantIdentity("http://localhost:8123", "controlled-token"), home: HomeAssistantSynthesizer.synthesize(fixture) } }));
     new MenuMijiaWindowsApp(element("#app"));
     await waitFor(() => !!document.querySelector("[data-ha-error]"));
-    await click("#btn-toggle-assistant");
     assert.match(textOf("[data-ha-error]"), /Connection lost/);
     assert.match(tile("study-light"), /书房灯/);
     failing = false;
     await click("#btn-refresh");
     await waitFor(() => !document.querySelector("[data-ha-error]"));
     assert.match(tile("study-light"), /书房灯/);
-    assert.equal(document.querySelector("#command-input"), null);
   });
   it("rejects malformed cached HA homes and refreshes into an empty state", async () => {
     let snapshots = 0;
@@ -2046,7 +1672,7 @@ describe("Home Assistant source", () => {
     assert.equal(snapshots, 1);
   });
   for (const delayed of [false, true]) {
-    it(`discards ${delayed ? "in-flight" : "completed"} undo and habit writes after an HA account change`, async () => {
+    it(`discards ${delayed ? "in-flight" : "completed"} undo after an HA account change`, async () => {
       const calls: Array<Record<string, unknown>> = [];
       let finish: () => void = () => {};
       const invoke = async (name: string, args: Record<string, unknown> = {}) => {
@@ -2062,7 +1688,7 @@ describe("Home Assistant source", () => {
       localStorage.setItem("menumijia.windows.settings.v2", JSON.stringify({ connectionMode: "homeAssistant", haBaseURL: "http://localhost:8123", hasCompletedOnboarding: true }));
       new MenuMijiaWindowsApp(element("#app"));
       await waitFor(() => !!document.querySelector('[data-body-device="study-light"]'));
-      await command("关闭书房灯");
+      await click('[data-toggle-device="study-light"]');
       await waitFor(() => calls.length === 1);
       await click("#btn-settings");
       const token = document.querySelector<HTMLInputElement>("#settings-ha-token");
@@ -2071,14 +1697,8 @@ describe("Home Assistant source", () => {
       await click("#btn-save-settings");
       if (delayed) { finish(); await setImmediate(); }
       await waitFor(() => !!document.querySelector('[data-body-device="study-light"]'));
-      const before = localStorage.getItem("menumijia.windows.settings.v2");
-      await command("撤销");
+      assert.equal(document.querySelector("#btn-undo"), null);
       assert.equal(calls.length, 1, "Undo must not send account A's inverse to account B");
-      assert.equal(localStorage.getItem("menumijia.windows.settings.v2"), before, "Undo must not unrecord another source's habits");
-      if (delayed) {
-        const stored = JSON.parse(before ?? "{}");
-        assert.deepEqual(stored.habitEntries, []);
-      }
     });
   }
   it("connects without Xiaomi requests and keeps credentials out of settings", async () => {
@@ -2097,9 +1717,8 @@ describe("Home Assistant source", () => {
     await waitFor(() => (document.body.textContent ?? "").includes("Home Assistant disconnected"));
     assert.match(tile("study-light"), /书房灯/);
   });
-  it("shows HA refresh errors outside the hidden assistant bar", async () => {
+  it("shows HA refresh errors in the panel", async () => {
     startHA(true);
-    await click("#btn-toggle-assistant");
     await waitFor(() => !!document.querySelector("[data-ha-error]"));
     assert.match(textOf("[data-ha-error]"), /Home Assistant disconnected/);
   });
@@ -2107,7 +1726,7 @@ describe("Home Assistant source", () => {
     const state = startHA();
     await waitFor(() => !!document.querySelector('[data-body-device="study-light"]'));
     state.failCommand();
-    await command("关闭书房灯");
+    await click('[data-toggle-device="study-light"]');
     await waitFor(() => (document.body.textContent ?? "").includes("Home Assistant request failed"));
     assert.ok(state.calls.includes("ha_execute"));
     assert.match(tile("study-light"), /开启|50%|50 %/);
@@ -2161,7 +1780,7 @@ describe("Home Assistant source", () => {
     localStorage.setItem("menumijia.windows.settings.v2",JSON.stringify({connectionMode:"homeAssistant",haBaseURL:"http://localhost:8123",hasCompletedOnboarding:true}));
     new MenuMijiaWindowsApp(element("#app"));
     await waitFor(() => !!document.querySelector('[data-body-device="study-light"]'));
-    const input = element("#command-input");
+    const input = openSearch();
     input.focus();
     const card = element('[data-body-device="study-light"]');
     await click("#btn-refresh");
@@ -2169,47 +1788,5 @@ describe("Home Assistant source", () => {
     assert.equal(element('[data-body-device="study-light"]'),card);
     assert.equal(document.activeElement,input);
     assert.match(tile("study-light"),/78%|78 %/);
-  });
-});
-
-describe("GrokBall side attachment (#114)", () => {
-  it("opens four side actions, executes with undo, and collapses with Escape", async () => {
-    startDemo();
-    await click("#btn-grok-ball");
-    assert.equal(document.querySelectorAll(".cc-grok-sidebar [data-proactive-id]").length, 4);
-    await click(".cc-grok-pill");
-    await waitFor(() => document.querySelector("#btn-undo") !== null);
-    assert.equal(document.querySelector(".cc-grok-stage"), null);
-    assert.equal(element(".cc-grok-ball").dataset.emotion, "33");
-    await click("#btn-undo");
-    await click("#btn-grok-ball");
-    dom.dispatchEvent(new dom.KeyboardEvent("keydown", { key: "Escape" }));
-    assert.equal(document.querySelector(".cc-grok-stage"), null);
-  });
-
-  it("keeps learned scenes outside the reversible side attachment", async () => {
-    localStorage.setItem(["menumijia", "windows", "settings", "v2"].join("."), JSON.stringify({
-      connectionMode: "demo", hasCompletedOnboarding: true,
-      habitEntries: [{ bucket: "深夜", targetId: "scene.home", operationKey: "scene:activate", count: 99 }],
-    }));
-    new MenuMijiaWindowsApp(element("#app"));
-    await click("#btn-grok-ball");
-    assert.equal(document.querySelector('[data-proactive-id*="scene.home"]'), null);
-    assert.equal(document.querySelectorAll(".cc-grok-pill").length, 4);
-  });
-
-  it("shows emotion 34 on the ball when a Home Assistant refresh fails", async () => {
-    const invoke = async (name: string) => {
-      if (name === "secure_store_get") return "controlled-token";
-      if (name === "ha_snapshot") throw new Error("Home Assistant unreachable");
-      return undefined;
-    };
-    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: { invoke }, configurable: true });
-    localStorage.setItem(["menumijia", "windows", "settings", "v2"].join("."), JSON.stringify({
-      connectionMode: "homeAssistant", haBaseURL: "http://localhost:8123", hasCompletedOnboarding: true,
-    }));
-    new MenuMijiaWindowsApp(element("#app"));
-    await waitFor(() => !!document.querySelector("[data-ha-error]"));
-    assert.equal(element(".cc-grok-ball").dataset.emotion, "34");
   });
 });
