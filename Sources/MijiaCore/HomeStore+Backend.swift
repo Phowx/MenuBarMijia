@@ -81,6 +81,8 @@ extension HomeStore {
 
     public func startListening() {
         hasReceivedInitialSnapshot = false
+        connectionStatus = .connecting
+        connectionIssue = nil
         eventTask?.cancel()
         let stream = provider.events()
         eventTask = Task { [weak self] in
@@ -143,10 +145,18 @@ extension HomeStore {
 
     private func handleProviderEvent(_ event: HomeProviderEvent) {
         switch event {
+        case .connectionIssue(let issue):
+            connectionIssue = issue
         case .statusChanged(let status):
             if connectionStatus != status { connectionStatus = status }
+            if case .connected = status {
+                connectionIssue = nil
+            } else if case .disconnected(let message) = status, homeBackend != .xiaomiCloud {
+                connectionIssue = ConnectionIssue(message: message, recovery: .retrySync)
+            }
 
         case .snapshotUpdated(let snapshot):
+            lastSnapshotAt = Date()
             if !hasReceivedInitialSnapshot { hasReceivedInitialSnapshot = true }
             var nextRooms = snapshot.rooms
             if let lgDev = latestLGDevice, lgConfig.isEnabled,
@@ -366,17 +376,26 @@ extension HomeStore {
         invalidateUndoContext()
 
         let previousBackend = homeBackend
+        if previousBackend != backend {
+            devices = []
+            rooms = []
+            homes = []
+            environmentReadings = []
+            scenes = []
+            lastSnapshotAt = nil
+        }
         self.homeBackend = backend
         eventTask?.cancel()
         shutdownCurrentProvider()
 
         switch backend {
         case .homeAssistant:
-            self.provider = makeHAProvider(baseURLString: serverURLString, token: KeychainHelper.loadToken(defaults: userDefaults))
+            self.provider = makeHAProvider(baseURLString: serverURLString, token: loadHACredentials())
         case .xiaomiCloud:
-            nonisolated(unsafe) let ud = userDefaults
-            self.provider = MiCloudProvider(sessionLoader: { MiSessionStore.load(defaults: ud) })
+            self.provider = makeMiCloudProvider()
         case .demo:
+            credentialIssue = nil
+            credentialsNeedReading = false
             // Strictly offline: stop any LAN TV and update work started by the previous backend (#47).
             if let lgClient = lgWebOSClient {
                 Task { await lgClient.stop() }
@@ -401,7 +420,18 @@ extension HomeStore {
 
     public func completeMiLogin(_ session: MiSession) {
         invalidateUndoContext()
-        MiSessionStore.save(session, defaults: userDefaults)
+        let saved = MiSessionStore.save(session, defaults: userDefaults, vault: credentialVault)
+        pendingMiSession = saved ? nil : session
+        activeMiSession = session
+        credentialIssue = saved ? nil : Self.unsavedCredentialIssue
+        if miSessionScopeIdentifier != session.historyScopeIdentifier {
+            devices = []
+            rooms = []
+            homes = []
+            environmentReadings = []
+            scenes = []
+            lastSnapshotAt = nil
+        }
         self.miSessionMaskedUserId = session.maskedUserId
         self.miSessionScopeIdentifier = session.historyScopeIdentifier
         if let region = MiCloudRegion(rawValue: session.region.lowercased()) {
@@ -411,14 +441,24 @@ extension HomeStore {
         self.completeOnboarding()
         eventTask?.cancel()
         shutdownCurrentProvider()
-        nonisolated(unsafe) let ud = userDefaults
-        self.provider = MiCloudProvider(sessionLoader: { MiSessionStore.load(defaults: ud) })
+        self.provider = makeMiCloudProvider()
         startListening()
-        showToast(L10n.tr("已登录米家账号 (\(session.maskedUserId))", "Signed in to Xiaomi Home (\(session.maskedUserId))"))
+        if saved {
+            showToast(L10n.tr("已登录米家账号 (\(session.maskedUserId))", "Signed in to Xiaomi Home (\(session.maskedUserId))"))
+        } else {
+            showToast(Self.unsavedCredentialIssue.message, isError: true)
+        }
     }
 
     public func logoutMiAccount() {
-        MiSessionStore.clear(defaults: userDefaults)
+        guard MiSessionStore.clear(defaults: userDefaults, vault: credentialVault) else {
+            showToast(L10n.tr("无法从钥匙串移除登录信息，请重试退出登录。", "Could not remove saved credentials. Retry signing out."), isError: true)
+            return
+        }
+        activeMiSession = nil
+        pendingMiSession = nil
+        credentialIssue = nil
+        lastSnapshotAt = nil
         self.miSessionMaskedUserId = nil
         self.miSessionScopeIdentifier = nil
         if homeBackend == .xiaomiCloud {
@@ -429,14 +469,13 @@ extension HomeStore {
             self.scenes = []
             eventTask?.cancel()
             shutdownCurrentProvider()
-            nonisolated(unsafe) let ud = userDefaults
-            self.provider = MiCloudProvider(sessionLoader: { MiSessionStore.load(defaults: ud) })
+            self.provider = makeMiCloudProvider()
             startListening()
         }
         showToast(L10n.tr("已退出米家账号", "Signed out of Xiaomi Home"))
     }
 
-    private func shutdownCurrentProvider() {
+    func shutdownCurrentProvider() {
         if let old = provider as? MiCloudProvider {
             Task { await old.shutdown() }
         } else if let old = provider as? HAWebSocketProvider {
@@ -445,6 +484,12 @@ extension HomeStore {
     }
 
     public func updateConnection(serverURL: String, token: String) {
+        // An empty field caused by a failed read is not an instruction to erase the saved token.
+        if credentialsNeedReading, homeBackend == .homeAssistant,
+           token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            showToast(CredentialStoreError.unavailable.localizedDescription, isError: true)
+            return
+        }
         invalidateUndoContext()
         let normalized = HAWebSocketProvider.normalizeBaseURL(serverURL)
         if normalized != HAWebSocketProvider.normalizeBaseURL(serverURLString) {
@@ -452,10 +497,14 @@ extension HomeStore {
         }
         pendingHAAddressSuggestion = nil
         self.serverURLString = normalized
-        KeychainHelper.saveToken(token)
+        let saved = KeychainHelper.saveToken(token, defaults: userDefaults, vault: credentialVault)
+        pendingHAToken = saved ? nil : token
+        credentialsNeedReading = false
+        credentialIssue = saved ? nil : Self.unsavedCredentialIssue
         if !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             self.completeOnboarding()
         }
+        if !saved { showToast(Self.unsavedCredentialIssue.message, isError: true) }
         if homeBackend != .homeAssistant || !(provider is HAWebSocketProvider) {
             switchBackend(.homeAssistant)
         } else if let haProvider = provider as? HAWebSocketProvider {
@@ -463,7 +512,7 @@ extension HomeStore {
                 await haProvider.updateCredentials(baseURLString: normalized, token: token)
             }
         }
-        showToast(L10n.tr("已保存并重新连接 Home Assistant", "Saved and reconnecting to Home Assistant"))
+        if saved { showToast(L10n.tr("已保存并重新连接 Home Assistant", "Saved and reconnecting to Home Assistant")) }
     }
 
     /// The user chose `instance` (a tap in setup or settings, or 切换 on a suggestion).
@@ -484,7 +533,7 @@ extension HomeStore {
         invalidateUndoContext()
         self.serverURLString = instance.baseURL
         if reconnectProvider, let haProvider = provider as? HAWebSocketProvider {
-            let token = KeychainHelper.loadToken(defaults: userDefaults)
+            let token = loadHACredentials()
             Task {
                 await haProvider.updateCredentials(baseURLString: instance.baseURL, token: token)
             }
@@ -515,7 +564,7 @@ extension HomeStore {
             let normalizedCurrent = HAWebSocketProvider.normalizeBaseURL(serverURLString)
             let isDefaultURL = (normalizedCurrent == KeychainHelper.defaultNASURL)
                 || (userDefaults.string(forKey: "ha_server_url") == nil)
-            let hasToken = !KeychainHelper.loadToken(defaults: userDefaults).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            let hasToken = !haTokenForCurrentSession.isEmpty
             if isDefaultURL && !hasToken && first.baseURL != normalizedCurrent {
                 applyDiscoveredHAInstance(first, reconnectProvider: false)
             }

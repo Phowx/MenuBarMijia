@@ -32,6 +32,7 @@ public enum ConnectionStatus: Equatable, Sendable {
 public enum HomeProviderEvent: Sendable {
     case statusChanged(ConnectionStatus)
     case snapshotUpdated(SynthesizedHome)
+    case connectionIssue(ConnectionIssue?)
 }
 
 public enum HomeProviderError: LocalizedError, Equatable, Sendable {

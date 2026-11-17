@@ -37,21 +37,36 @@ public enum KeychainHelper {
     public static let defaultSeededToken = ""
 
     public static func loadToken(defaults: UserDefaults = .standard) -> String {
-        guard defaults === UserDefaults.standard else {
+        (try? loadTokenChecked(defaults: defaults)) ?? ""
+    }
+
+    public static func loadTokenChecked(defaults: UserDefaults = .standard, vault: CredentialVault? = nil) throws -> String {
+        guard defaults === UserDefaults.standard || vault != nil else {
             return loadSecret(account: account, defaults: defaults)
         }
-        if let envToken = ProcessInfo.processInfo.environment["HA_ACCESS_TOKEN"],
+        if vault == nil, let envToken = ProcessInfo.processInfo.environment["HA_ACCESS_TOKEN"],
            !envToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return envToken.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         // Credentials live only in the Keychain (#16). An unreadable item reads as "not signed in" instead of
         // looping on the Keychain authorization prompt.
-        return readKeychainSecret(account: account) ?? defaultSeededToken
+        switch (vault ?? .shared).lookup(account) {
+        case .missing: return ""
+        case .unavailable: throw CredentialStoreError.unavailable
+        case .value(let data):
+            guard let value = String(data: data, encoding: .utf8) else { throw CredentialStoreError.invalidData }
+            return value.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
     }
 
-    public static func saveToken(_ token: String) {
-        guard writeKeychainSecret(token, account: account) else { return }
-        UserDefaults.standard.removeObject(forKey: legacyPlaintextTokenKey)
+    @discardableResult
+    public static func saveToken(_ token: String, defaults: UserDefaults = .standard, vault: CredentialVault? = nil) -> Bool {
+        guard defaults === UserDefaults.standard || vault != nil else {
+            return saveSecret(token, account: account, defaults: defaults)
+        }
+        guard writeKeychainSecret(token, account: account, vault: vault ?? .shared) else { return false }
+        defaults.removeObject(forKey: legacyPlaintextTokenKey)
+        return true
     }
 
     // MARK: - Keychain Primitives

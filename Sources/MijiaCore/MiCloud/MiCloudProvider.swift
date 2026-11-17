@@ -7,7 +7,7 @@ public actor MiCloudProvider: HomeProvider {
     public typealias APIFactory = @Sendable (MiSession) -> any MiCloudAPI
 
     private let logger = Logger(subsystem: "com.jryang1997.MenuBarMijia", category: "MiCloudProvider")
-    private let sessionLoader: @Sendable () -> MiSession?
+    private let sessionLoader: @Sendable () throws -> MiSession?
     private let apiFactory: APIFactory
     private let specSource: any MiotSpecSource
     private let cameraBridge: any XiaomiCameraBridging
@@ -40,7 +40,7 @@ public actor MiCloudProvider: HomeProvider {
     private var pollRequested = false
 
     public init(
-        sessionLoader: @escaping @Sendable () -> MiSession? = { MiSessionStore.load() },
+        sessionLoader: @escaping @Sendable () throws -> MiSession? = { try MiSessionStore.loadChecked() },
         apiFactory: @escaping APIFactory = { MiCloudClient(session: $0) },
         specSource: any MiotSpecSource = MiotSpecStore(),
         cameraBridge: any XiaomiCameraBridging = XiaomiCameraBridge.shared,
@@ -87,14 +87,9 @@ public actor MiCloudProvider: HomeProvider {
             restartLoop()
             return
         }
-        // After switching homes, devices of a home never polled would flash as off; wait for their values.
-        if !devices.isEmpty, hasValuesForScope() {
-            emitSnapshot()
-        }
         do {
             try await discover(api)
             try await poll(api, dids: nil)
-            continuation?.yield(.statusChanged(.connected))
         } catch {
             report(error)
         }
@@ -106,9 +101,13 @@ public actor MiCloudProvider: HomeProvider {
     }
 
     private func runLoop() async {
-        guard let session = sessionLoader() else {
+        let session: MiSession
+        do {
+            guard let loaded = try sessionLoader() else { throw MiCloudError.notLoggedIn }
+            session = loaded
+        } catch {
             api = nil
-            continuation?.yield(.statusChanged(.disconnected(MiCloudError.notLoggedIn.localizedDescription)))
+            report(error)
             return
         }
         let api = apiFactory(session)
@@ -119,11 +118,10 @@ public actor MiCloudProvider: HomeProvider {
             continuation?.yield(.statusChanged(.connecting))
             do {
                 try await discover(api)
-                continuation?.yield(.statusChanged(.connected))
-                backoff = 2
                 var polls = 0
                 while !Task.isCancelled {
                     try await poll(api, dids: nil)
+                    backoff = 2
                     try await waitForNextPoll()
                     polls += 1
                     if polls % deviceRefreshEveryPolls == 0 {
@@ -205,20 +203,22 @@ public actor MiCloudProvider: HomeProvider {
     private func report(_ error: any Error) {
         let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         logger.error("Mi cloud error: \(message, privacy: .public)")
+        if (error as? MiCloudError) == .sessionExpired {
+            api = nil
+            loopTask?.cancel()
+        }
+        continuation?.yield(.connectionIssue(ConnectionIssue(error: error)))
         continuation?.yield(.statusChanged(.disconnected(message)))
     }
 
     // MARK: Discovery & Polling
 
     private func discover(_ api: any MiCloudAPI) async throws {
-        try await refreshDeviceList(api)
-        do {
-            rooms = try await api.homeRooms()
-        } catch MiCloudError.sessionExpired {
-            throw MiCloudError.sessionExpired
-        } catch {
-            logger.notice("Room list unavailable, devices go to 全屋: \(error.localizedDescription, privacy: .public)")
-        }
+        let nextDevices = try await api.deviceList()
+        let nextRooms = try await api.homeRooms()
+        devices = nextDevices
+        rooms = nextRooms
+        await loadMissingSpecs()
         logger.info("Mi cloud rooms: \(self.rooms.count, privacy: .public)")
     }
 
@@ -292,6 +292,10 @@ public actor MiCloudProvider: HomeProvider {
             pollsSinceContextChange += 1
         }
         emitSnapshot()
+        if dids == nil {
+            continuation?.yield(.connectionIssue(nil))
+            continuation?.yield(.statusChanged(.connected))
+        }
     }
 
     private func propKeys(of scoped: [MiDeviceRecord], dids: Set<String>?) -> [MiotPropKey] {
@@ -301,10 +305,6 @@ public actor MiCloudProvider: HomeProvider {
             keys.append(contentsOf: MiotSynthesizer.requiredProps(for: d, spec: spec))
         }
         return keys
-    }
-
-    private func hasValuesForScope() -> Bool {
-        propKeys(of: scopedDevicesAndRooms().devices, dids: nil).allSatisfy { values[$0] != nil }
     }
 
     /// The selected home's rooms and devices, plus parents of included split keys so their spec and
@@ -389,7 +389,11 @@ public actor MiCloudProvider: HomeProvider {
 
     private func followUpPoll(did: String) async {
         guard let api else { return }
-        try? await poll(api, dids: [did])
+        do {
+            try await poll(api, dids: [did])
+        } catch {
+            report(error)
+        }
     }
 
     public func fetchSensorHistory(

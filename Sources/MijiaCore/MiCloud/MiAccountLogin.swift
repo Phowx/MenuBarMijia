@@ -214,25 +214,44 @@ public enum MiSessionStore {
     private static let passTokenField = Data("\"passToken\"".utf8)
 
     public static func load(defaults: UserDefaults = .standard) -> MiSession? {
-        guard let data = storedData(defaults: defaults),
-              let session = try? JSONDecoder().decode(MiSession.self, from: data) else { return nil }
+        try? loadChecked(defaults: defaults)
+    }
+
+    public static func loadChecked(defaults: UserDefaults = .standard, vault: CredentialVault? = nil) throws -> MiSession? {
+        let data: Data
+        if defaults !== UserDefaults.standard, vault == nil {
+            guard let saved = defaults.data(forKey: fallbackDefaultsKey) else { return nil }
+            data = saved
+        } else {
+            switch (vault ?? .shared).lookup(keychainAccount) {
+            case .value(let saved): data = saved
+            case .missing: return nil
+            case .unavailable: throw CredentialStoreError.unavailable
+            }
+        }
+        guard let session = try? JSONDecoder().decode(MiSession.self, from: data) else {
+            throw CredentialStoreError.invalidData
+        }
         // A session saved by ≤1.0.6 still carries `passToken`; rewrite it without (#27, ADR-0004).
         if data.range(of: passTokenField) != nil, let stripped = try? JSONEncoder().encode(session) {
-            store(stripped, defaults: defaults)
+            store(stripped, defaults: defaults, vault: vault)
         }
         return session
     }
 
     @discardableResult
-    public static func save(_ session: MiSession, defaults: UserDefaults = .standard) -> Bool {
+    public static func save(_ session: MiSession, defaults: UserDefaults = .standard, vault: CredentialVault? = nil) -> Bool {
         guard let data = try? JSONEncoder().encode(session) else { return false }
-        return store(data, defaults: defaults)
+        return store(data, defaults: defaults, vault: vault)
     }
 
-    public static func clear(defaults: UserDefaults = .standard) {
+    @discardableResult
+    public static func clear(defaults: UserDefaults = .standard, vault: CredentialVault? = nil) -> Bool {
+        if defaults === UserDefaults.standard || vault != nil {
+            guard (vault ?? .shared).set(nil, for: keychainAccount) else { return false }
+        }
         defaults.removeObject(forKey: fallbackDefaultsKey)
-        guard defaults === UserDefaults.standard else { return }
-        KeychainHelper.deleteKeychainItem(account: keychainAccount)
+        return true
     }
 
     /// Re-encodes a ≤1.0.6 `UserDefaults` session for the Keychain, dropping the `passToken` it carried
@@ -242,22 +261,15 @@ public enum MiSessionStore {
         return try? JSONEncoder().encode(session)
     }
 
-    private static func storedData(defaults: UserDefaults) -> Data? {
-        guard defaults === UserDefaults.standard else {
-            return defaults.data(forKey: fallbackDefaultsKey)
-        }
-        return KeychainHelper.readKeychainData(account: keychainAccount)
-    }
-
     /// `data` is already re-encoded through `MiSession`, so no `passToken` reaches the store.
     @discardableResult
-    private static func store(_ data: Data, defaults: UserDefaults) -> Bool {
-        guard defaults === UserDefaults.standard else {
+    private static func store(_ data: Data, defaults: UserDefaults, vault: CredentialVault? = nil) -> Bool {
+        guard defaults === UserDefaults.standard || vault != nil else {
             defaults.set(data, forKey: fallbackDefaultsKey)
             return true
         }
         // The vault item itself is `AfterFirstUnlockThisDeviceOnly`, so the session stays off backups.
-        let written = KeychainHelper.writeKeychainData(data, account: keychainAccount)
+        let written = KeychainHelper.writeKeychainData(data, account: keychainAccount, vault: vault ?? .shared)
         guard written else { return false }
         // The plaintext mirror is gone (#16): the Keychain is the only store.
         defaults.removeObject(forKey: fallbackDefaultsKey)

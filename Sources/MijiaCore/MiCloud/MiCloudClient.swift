@@ -236,12 +236,12 @@ public actor MiCloudClient: MiCloudAPI {
     }
 
     static func decodeResponse(_ body: Data, statusCode: Int, signedNonce: String) throws -> JSONValue {
-        if statusCode == 401 || statusCode == 403 { throw MiCloudError.sessionExpired }
+        if statusCode == 401 { throw MiCloudError.sessionExpired }
+        guard statusCode == 200 else { throw MiCloudError.http(statusCode) }
         // Errors come back as plain JSON; successes are base64(RC4(json)).
         if let plain = try? JSONDecoder().decode(JSONValue.self, from: body), case .object = plain {
             return try unwrapResult(plain)
         }
-        guard statusCode == 200 else { throw MiCloudError.http(statusCode) }
         guard let text = String(data: body, encoding: .utf8),
               let decrypted = try? MiCloudCrypto.decryptResponse(text, signedNonce: signedNonce),
               let json = try? JSONDecoder().decode(JSONValue.self, from: decrypted) else {
@@ -251,17 +251,21 @@ public actor MiCloudClient: MiCloudAPI {
     }
 
     static func unwrapResult(_ json: JSONValue) throws -> JSONValue {
-        let code = json["code"]?.intValue ?? 0
+        guard case .number(let rawCode) = json["code"], let code = Int(exactly: rawCode) else {
+            throw MiCloudError.badResponse(L10n.tr("缺少有效状态码", "Missing a valid status code"))
+        }
         let message = json["message"]?.stringValue ?? json["desc"]?.stringValue ?? ""
-        if code == 0 { return json["result"] ?? .null }
         let lower = message.lowercased()
         if code == 2 || code == 3
             || lower.contains("auth err")
             || lower.contains("servicetoken_expired")
-            || lower.contains("token expired")
-            || lower.contains("invalid signature") {
+            || lower.contains("token expired") {
             throw MiCloudError.sessionExpired
         }
+        if lower.contains("invalid signature") {
+            throw MiCloudError.badResponse(L10n.tr("签名校验失败，请重试同步", "Signature validation failed; retry syncing"))
+        }
+        if code == 0 { return json["result"] ?? .null }
         throw MiCloudError.api(code: code, message: message)
     }
 
@@ -290,7 +294,7 @@ public actor MiCloudClient: MiCloudAPI {
             ]
             if !startDid.isEmpty { data["start_did"] = .string(startDid) }
             let result = try await request("v2/home/device_list_page", data: .object(data))
-            records += Self.parseDeviceList(result)
+            records += try Self.parseDeviceList(result)
             let next = result["next_start_did"]?.idString ?? ""
             guard result["has_more"]?.boolValue == true, !next.isEmpty, next != startDid else { break }
             startDid = next
@@ -306,12 +310,16 @@ public actor MiCloudClient: MiCloudAPI {
             "get_split_device": .bool(false),
             "support_smart_home": .bool(true),
         ]))
-        return Self.parseDeviceList(result)
+        return try Self.parseDeviceList(result)
     }
 
-    static func parseDeviceList(_ result: JSONValue) -> [MiDeviceRecord] {
-        (result["list"]?.arrayValue ?? []).compactMap { item in
-            guard let did = item["did"]?.idString, let model = item["model"]?.stringValue else { return nil }
+    static func parseDeviceList(_ result: JSONValue) throws -> [MiDeviceRecord] {
+        guard let list = result["list"]?.arrayValue else {
+            throw MiCloudError.badResponse(L10n.tr("设备列表格式异常", "Malformed device list"))
+        }
+        let records: [MiDeviceRecord] = list.compactMap { item in
+            guard let did = item["did"]?.idString, !did.isEmpty,
+                  let model = item["model"]?.stringValue, !model.isEmpty else { return nil }
             let split = item["extra"]?["split"]
             return MiDeviceRecord(
                 did: did,
@@ -324,6 +332,10 @@ public actor MiCloudClient: MiCloudAPI {
                 localIp: item["localip"]?.stringValue
             )
         }
+        guard list.isEmpty || !records.isEmpty else {
+            throw MiCloudError.badResponse(L10n.tr("设备列表无法解析", "Device list could not be decoded"))
+        }
+        return records
     }
 
     public func cameraLocalIP(did: String) async throws -> String? {
@@ -371,12 +383,18 @@ public actor MiCloudClient: MiCloudAPI {
                 "limit": .number(300), "app_ver": .number(7),
             ]))
         }
-        return Self.parseRooms(merged)
+        return try Self.parseRooms(merged)
     }
 
-    static func parseRooms(_ result: JSONValue) -> [MiRoom] {
+    static func parseRooms(_ result: JSONValue) throws -> [MiRoom] {
+        guard let homes = result["homelist"]?.arrayValue else {
+            throw MiCloudError.badResponse(L10n.tr("家庭列表格式异常", "Malformed home list"))
+        }
         var rooms: [MiRoom] = []
-        for home in result["homelist"]?.arrayValue ?? [] {
+        for home in homes {
+            guard home["id"]?.idString != nil else {
+                throw MiCloudError.badResponse(L10n.tr("家庭列表无法解析", "Home list could not be decoded"))
+            }
             let homeId = home["id"]?.idString ?? ""
             let homeName = home["name"]?.stringValue ?? ""
             for room in home["roomlist"]?.arrayValue ?? [] {
@@ -408,14 +426,17 @@ public actor MiCloudClient: MiCloudAPI {
                 .object(["did": .string($0.did), "siid": .number(Double($0.siid)), "piid": .number(Double($0.piid))])
             }
             let result = try await request("miotspec/prop/get", data: .object(["params": .array(params)]))
-            values.merge(Self.parsePropValues(result)) { _, new in new }
+            values.merge(try Self.parsePropValues(result)) { _, new in new }
         }
         return values
     }
 
-    static func parsePropValues(_ result: JSONValue) -> [MiotPropKey: JSONValue] {
+    static func parsePropValues(_ result: JSONValue) throws -> [MiotPropKey: JSONValue] {
+        guard let list = result.arrayValue else {
+            throw MiCloudError.badResponse(L10n.tr("设备状态格式异常", "Malformed device states"))
+        }
         var values: [MiotPropKey: JSONValue] = [:]
-        for item in result.arrayValue ?? [] {
+        for item in list {
             guard let did = item["did"]?.idString,
                   let siid = item["siid"]?.intValue,
                   let piid = item["piid"]?.intValue,

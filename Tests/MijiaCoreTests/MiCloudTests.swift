@@ -53,7 +53,7 @@ struct MiCloudCryptoTests {
         #expect(String(data: plain, encoding: .utf8) == Vectors.respPlain)
 
         let result = try MiCloudClient.decodeResponse(Data(Vectors.respCipher.utf8), statusCode: 200, signedNonce: Vectors.signedNonce)
-        let devices = MiCloudClient.parseDeviceList(result)
+        let devices = try MiCloudClient.parseDeviceList(result)
         #expect(devices == [MiDeviceRecord(did: "123", name: "灯", model: "yeelink.light.ceiling22", isOnline: true)])
     }
 
@@ -406,13 +406,13 @@ struct MiotSynthesizerTests {
     }
 
     @Test("device_list_page split metadata is parsed from extra.split")
-    func parseSplitRecord() {
+    func parseSplitRecord() throws {
         let result: JSONValue = .object(["list": .array([.object([
             "did": .string("100.s3"), "name": .string("氛围灯"), "model": .string("lemesh.switch.sw2f12"),
             "isOnline": .bool(true),
             "extra": .object(["split": .object(["parentId": .string("100"), "moduleId": .number(3)])]),
         ])])])
-        #expect(MiCloudClient.parseDeviceList(result) == [
+        #expect(try MiCloudClient.parseDeviceList(result) == [
             MiDeviceRecord(did: "100.s3", name: "氛围灯", model: "lemesh.switch.sw2f12", isOnline: true, splitParentDid: "100", splitSiid: 3),
         ])
     }
@@ -960,7 +960,7 @@ struct MiCloudClientTests {
     @Test("Room list parsing flattens homelist.roomlist")
     func rooms() throws {
         let json = try JSONDecoder().decode(JSONValue.self, from: Data(#"{"homelist":[{"id":"h1","roomlist":[{"id":"r1","name":"客厅","dids":["1","2"]},{"id":2,"name":"卧室","dids":[]}]}]}"#.utf8))
-        #expect(MiCloudClient.parseRooms(json) == [
+        #expect(try MiCloudClient.parseRooms(json) == [
             MiRoom(id: "r1", name: "客厅", dids: ["1", "2"], homeId: "h1"),
             MiRoom(id: "2", name: "卧室", dids: [], homeId: "h1"),
         ])
@@ -969,7 +969,7 @@ struct MiCloudClientTests {
     @Test("Each home becomes a HomeOption; room-less home devices land in an unnamed room")
     func homes() throws {
         let json = try JSONDecoder().decode(JSONValue.self, from: Data(#"{"homelist":[{"id":"h1","name":"东澜府","dids":["1","9"],"roomlist":[{"id":"r1","name":"客厅","dids":["1","2"]}]},{"id":"h2","name":"果果家","roomlist":[{"id":"r2","name":"卧室","dids":["3"]}]}]}"#.utf8))
-        let rooms = MiCloudClient.parseRooms(json)
+        let rooms = try MiCloudClient.parseRooms(json)
         #expect(rooms.last(where: { $0.homeId == "h1" }) == MiRoom(id: "home_h1", name: "", dids: ["1", "9"], homeId: "h1", homeName: "东澜府"))
         #expect(MiCloudProvider.homeOptions(from: rooms) == [
             HomeOption(id: "h1", name: "东澜府", deviceCount: 3),
