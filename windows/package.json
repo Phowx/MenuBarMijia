@@ -3,7 +3,7 @@
   "version": "1.1.5",
   "private": true,
   "type": "module",
-  "description": "MenuBarMijia for Windows 11 — System Tray Smart Home Control Center with Xiaomi Cloud QR Login & Jev Decision Model",
+  "description": "MenuBarMijia for Windows 11 — System tray controls for Xiaomi Cloud and Home Assistant",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
@@ -18,5 +18,8 @@
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vite": "^6.0.5"
+  },
+  "dependencies": {
+    "pinyin-pro": "3.29.5"
   }
 }

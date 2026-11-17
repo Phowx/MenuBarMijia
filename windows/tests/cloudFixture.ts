@@ -41,6 +41,7 @@ export function cloudFixture(intents: readonly DeviceIntent[]) {
   const writes: Array<{ piid: number; value: unknown; accepted: boolean }> = [];
   const rejectedValues = new Map<number, unknown>([[2, 80]]);
   let completedReads = 0;
+  let deviceListFails = false;
   let readGate: {
     readonly promise: Promise<void>;
     readonly started: Promise<void>;
@@ -57,6 +58,7 @@ export function cloudFixture(intents: readonly DeviceIntent[]) {
     if (url.includes("/instances?")) return { status: 200, headers: {}, body: JSON.stringify({ instances: [{ model, type: spec.type }] }) };
     let result: unknown = {};
     if (url.includes("device_list")) {
+      if (deviceListFails) throw new Error("Fixture device list unavailable");
       result = { list: deviceRecords };
     } else if (url.includes("homeroom/")) {
       result = { homelist: [{ id: "fixture-home", name: "测试家庭", roomlist: roomRecords }] };
@@ -113,6 +115,7 @@ export function cloudFixture(intents: readonly DeviceIntent[]) {
     sensorValues,
     sensorRecord: (did: string, name: string) => ({ did, name, model: sensorModel, isOnline: true, spec_type: sensorSpec.type }),
     writes,
+    setDeviceListFailure: (fails: boolean) => { deviceListFails = fails; },
     completedReads: () => completedReads,
     /** Captures the next property read's values, then waits until the test releases the response. */
     holdNextRead: () => {
