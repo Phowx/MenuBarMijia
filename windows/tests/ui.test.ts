@@ -167,6 +167,81 @@ describe("Service endpoint submission", () => {
   });
 });
 
+describe("Tray startup and primary sensor preferences", () => {
+  it("reads the system startup state and only changes it from the explicit switch", async () => {
+    const writes: string[] = [];
+    let enabled = true;
+    let rejectChange = false;
+    const invoke = async (name: string) => {
+      if (name === "plugin:autostart|is_enabled") return enabled;
+      if (name === "plugin:autostart|enable" || name === "plugin:autostart|disable") {
+        writes.push(name);
+        if (rejectChange) throw new Error("Permission denied");
+        enabled = name.endsWith("|enable");
+      }
+      return undefined;
+    };
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: { invoke }, configurable: true });
+    startDemo();
+    assert.deepEqual(writes, []);
+    await click("#btn-settings");
+    assert.equal((element("#settings-autostart") as HTMLInputElement).checked, true);
+    await click("#settings-autostart");
+    assert.equal(enabled, false);
+    assert.equal((element("#settings-autostart") as HTMLInputElement).checked, false);
+    rejectChange = true;
+    await click("#settings-autostart");
+    assert.equal((element("#settings-autostart") as HTMLInputElement).checked, false);
+    assert.match(textOf('[role="alert"]'), /开机自启设置失败/);
+    await click("#btn-close-settings");
+    await click("#btn-settings");
+    assert.equal((element("#settings-autostart") as HTMLInputElement).checked, false);
+    assert.deepEqual(writes, ["plugin:autostart|disable", "plugin:autostart|enable"]);
+  });
+
+  it("recovers an unavailable startup status through retry", async () => {
+    let fail = true;
+    const invoke = async (name: string) => {
+      if (name === "plugin:autostart|is_enabled") {
+        if (fail) throw new Error("Unavailable");
+        return false;
+      }
+      return undefined;
+    };
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: { invoke }, configurable: true });
+    startDemo();
+    await click("#btn-settings");
+    assert.equal((element("#settings-autostart") as HTMLInputElement).disabled, true);
+    fail = false;
+    await click("#btn-retry-autostart");
+    assert.equal((element("#settings-autostart") as HTMLInputElement).disabled, false);
+    assert.equal(document.querySelector('[role="alert"]'), null);
+  });
+
+  it("shows one primary reading, remembers a selected device, and falls back when it is hidden", async () => {
+    startDemo();
+    const labels = () => [...document.querySelectorAll(".cc-env-label")].map((node) => node.textContent);
+    assert.deepEqual(labels(), ["客厅"]);
+    await click("#btn-settings");
+    const choose = (value: string) => {
+      const select = element("#settings-environment-reading") as HTMLSelectElement;
+      select.value = value;
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+    };
+    choose("climate.living_ac");
+    assert.deepEqual(labels(), ["客厅立式空调"]);
+    const saved = JSON.parse(localStorage.getItem("menumijia.windows.settings.v2") ?? "{}");
+    assert.equal(saved.environmentReadingId, "climate.living_ac");
+    choose("none");
+    assert.deepEqual(labels(), []);
+    choose("climate.living_ac");
+    await click("#btn-close-settings");
+    element('[data-tile-id="climate.living_ac"]').dispatchEvent(new dom.MouseEvent("contextmenu", { bubbles: true }) as unknown as Event);
+    await click('[data-hide-device="climate.living_ac"]');
+    assert.deepEqual(labels(), ["客厅"]);
+  });
+});
+
 describe("Windows device control and undo", () => {
   it("finds devices by name, room, full pinyin and initials without executing input", async () => {
     startDemo();
@@ -403,6 +478,61 @@ describe("Silent Xiaomi cloud refresh (#81)", { concurrency: false }, () => {
     await waitFor(() => !document.querySelector(".cc-search-section"));
   });
 
+  for (const [name, body, status, path] of [
+    ["signature failure with code zero", { code: 0, message: "invalid signature" }, 200, "device_list"],
+    ["missing device list", { code: 0, result: {} }, 200, "device_list"],
+    ["HTTP service failure with a success envelope", { code: 0, result: { list: [] } }, 503, "device_list"],
+    ["malformed device properties", { code: 0, result: {} }, 200, "miotspec/prop/get"],
+    ["room request failure", { code: 0, result: {} }, 503, "homeroom/"],
+  ] as const) {
+    it(`retains devices and cache, reports ${name} during silent sync, and recovers`, async () => {
+      const { cloud, triggerRefresh } = await readyCloudApp();
+      const cache = () => JSON.parse(localStorage.getItem("menumijia.windows.settings.v2")!).cachedXiaomiDevices;
+      const before = cache();
+      cloud.setResponse(path, { status, headers: {}, body: JSON.stringify(body) });
+      triggerRefresh();
+      await waitFor(() => !!document.querySelector("[data-cloud-error]"));
+      assert.match(tile("fixture-light"), /50%/);
+      assert.deepEqual(cache(), before);
+      assert.equal(document.querySelector("#btn-cloud-rescan"), null);
+      assert.ok(document.querySelector(".cc-status-dot.is-error"));
+      assert.match(textOf(".cc-subtitle"), /同步异常/);
+      cloud.setResponse(path, null);
+      cloud.values.set(2, 65);
+      triggerRefresh();
+      await waitFor(() => !document.querySelector("[data-cloud-error]"));
+      assert.match(tile("fixture-light"), /65%/);
+    });
+  }
+
+  for (const path of ["device_list", "homeroom/", "miotspec/prop/get"]) {
+    it(`surfaces session expiry from ${path} during silent sync and pauses polling`, async () => {
+      const { cloud, triggerRefresh } = await readyCloudApp();
+      cloud.setResponse(path, { status: 200, headers: {}, body: JSON.stringify({ code: 3, message: "auth err" }) });
+      triggerRefresh();
+      await waitFor(() => !!document.querySelector("#btn-cloud-rescan"));
+      assert.match(textOf("[data-cloud-error]"), /登录已过期/);
+      assert.match(tile("fixture-light"), /50%/);
+      const requests = cloud.requests.length;
+      triggerRefresh();
+      await setImmediate();
+      assert.equal(cloud.requests.length, requests);
+      cloud.setResponse(path, null);
+      await click("#btn-cloud-resync");
+      await waitFor(() => !document.querySelector("[data-cloud-error]"));
+      assert.match(tile("fixture-light"), /50%/);
+    });
+  }
+
+  it("accepts a valid empty device list and updates the cache", async () => {
+    const { cloud, triggerRefresh } = await readyCloudApp();
+    cloud.deviceRecords.length = 0;
+    triggerRefresh();
+    await waitFor(() => !document.querySelector('[data-tile-id="fixture-light"]'));
+    assert.equal(document.querySelector("[data-cloud-error]"), null);
+    assert.deepEqual(JSON.parse(localStorage.getItem("menumijia.windows.settings.v2")!).cachedXiaomiDevices, []);
+  });
+
   it("reapplies the offline visibility setting when polling changes connectivity", async () => {
     const { cloud, triggerRefresh } = await readyCloudApp();
     await click("#btn-settings");
@@ -437,7 +567,7 @@ describe("Silent Xiaomi cloud refresh (#81)", { concurrency: false }, () => {
     const initialRooms = rooms();
     const envLabels = () => Array.from(document.querySelectorAll(".cc-env-label"), (node) => node.textContent);
     const initialEnvLabels = envLabels();
-    assert.deepEqual(initialEnvLabels, ["主卧", "阳台"]);
+    assert.deepEqual(initialEnvLabels, ["主卧"]);
     const popover = element(".cc-popover");
     for (let i = 0; i < 4; i++) {
       cloud.deviceRecords.reverse();
@@ -672,6 +802,108 @@ describe("Silent Xiaomi cloud refresh (#81)", { concurrency: false }, () => {
 });
 
 describe("Credentials move out of localStorage (#28)", () => {
+  for (const cached of [false, true]) {
+    it(`shows session expiry on a credential-hydrated startup ${cached ? "with" : "without"} cached devices`, async () => {
+      const cloud = cloudFixture([]);
+      const settings = JSON.parse(localStorage.getItem("menumijia.windows.settings.v2")!);
+      const session = JSON.stringify(settings.miSession);
+      delete settings.miSession;
+      settings.cachedXiaomiDevices = cached ? MiotSynthesizer.synthesize(
+        cloud.deviceRecords.map((record) => ({ ...record, specType: record.spec_type })), [], {}, new Map(),
+      ).devices : [];
+      localStorage.setItem("menumijia.windows.settings.v2", JSON.stringify(settings));
+      cloud.setResponse("device_list", { status: 200, headers: {}, body: JSON.stringify({ code: 3 }) });
+      const originalInvoke = window.__TAURI_INTERNALS__!.invoke;
+      const invoke = async (cmd: string, args: Record<string, unknown> = {}) => {
+        if (cmd === "secure_store_get") return args.name === "mi_session" ? session : null;
+        return originalInvoke(cmd, args);
+      };
+      Object.defineProperty(window, "__TAURI_INTERNALS__", { value: { invoke }, configurable: true });
+      new MenuMijiaWindowsApp(element("#app"));
+      await waitFor(() => !!document.querySelector("#btn-cloud-rescan"));
+      assert.match(textOf("[data-cloud-error]"), /登录已过期/);
+      assert.equal(!!document.querySelector('[data-tile-id="fixture-light"]'), cached);
+      assert.deepEqual(JSON.parse(localStorage.getItem("menumijia.windows.settings.v2")!).cachedXiaomiDevices, settings.cachedXiaomiDevices);
+    });
+  }
+
+  for (const recovery of ["timer", "refresh"] as const) {
+    it(`recovers a temporary credential read failure via ${recovery} without deleting saved credentials`, async () => {
+      const cloud = cloudFixture([]);
+      const settings = JSON.parse(localStorage.getItem("menumijia.windows.settings.v2")!);
+      const session = JSON.stringify(settings.miSession);
+      delete settings.miSession;
+      settings.cachedXiaomiDevices = MiotSynthesizer.synthesize(
+        cloud.deviceRecords.map((record) => ({ ...record, specType: record.spec_type })), [], {}, new Map(),
+      ).devices;
+      localStorage.setItem("menumijia.windows.settings.v2", JSON.stringify(settings));
+      const originalInvoke = window.__TAURI_INTERNALS__!.invoke;
+      let failed = true;
+      let reads = 0;
+      const writes: string[] = [];
+      const invoke = async (cmd: string, args: Record<string, unknown> = {}) => {
+        if (cmd === "secure_store_get") {
+          reads++;
+          if (failed) throw new Error("Temporary credential access failure");
+          return args.name === "mi_session" ? session : null;
+        }
+        if (cmd === "secure_store_set" || cmd === "secure_store_delete") writes.push(cmd);
+        return originalInvoke(cmd, args);
+      };
+      Object.defineProperty(window, "__TAURI_INTERNALS__", { value: { invoke }, configurable: true });
+      let timerTick!: () => void;
+      const timerWindow = window as unknown as { setInterval: (handler: () => void) => number };
+      const originalSetInterval = timerWindow.setInterval;
+      timerWindow.setInterval = (handler) => { timerTick = handler; return 1; };
+      new MenuMijiaWindowsApp(element("#app"));
+      timerWindow.setInterval = originalSetInterval;
+      await waitFor(() => !!document.querySelector("[data-credential-error]"));
+      assert.ok(document.querySelector('[data-tile-id="fixture-light"]'));
+      await click("#btn-toggle-appearance");
+      assert.deepEqual(writes, []);
+      failed = false;
+      if (recovery === "timer") {
+        const realNow = Date.now;
+        Date.now = () => realNow() + 3_000;
+        try { timerTick(); } finally { Date.now = realNow; }
+      } else {
+        await click("#btn-refresh");
+      }
+      await waitFor(() => /50%/.test(document.querySelector('[data-body-device="fixture-light"]')?.textContent ?? ""));
+      await waitFor(() => !document.querySelector("[data-credential-error]"));
+      assert.equal(reads, 6);
+      assert.deepEqual(writes, []);
+      assert.equal(localStorage.getItem("menumijia.windows.settings.v2")!.includes("fixture-token"), false);
+      assert.equal(document.querySelector("#btn-cloud-rescan"), null);
+    });
+  }
+
+  it("shows a failed credential save and retries it without discarding the active session", async () => {
+    cloudFixture([]);
+    const originalInvoke = window.__TAURI_INTERNALS__!.invoke;
+    let failed = true;
+    let savedSession = "";
+    const invoke = async (cmd: string, args: Record<string, unknown> = {}) => {
+      if (cmd === "secure_store_set") {
+        if (failed) throw new Error("Temporary credential write failure");
+        if (args.name === "mi_session") savedSession = String(args.value);
+        return null;
+      }
+      return originalInvoke(cmd, args);
+    };
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: { invoke }, configurable: true });
+    new MenuMijiaWindowsApp(element("#app"));
+    await waitFor(() => !!document.querySelector("[data-credential-error]"));
+    assert.match(textOf("[data-credential-error]"), /尚未保存/);
+    await waitFor(() => /50%/.test(document.querySelector('[data-body-device="fixture-light"]')?.textContent ?? ""));
+    assert.equal(localStorage.getItem("menumijia.windows.settings.v2")!.includes("fixture-token"), false);
+    failed = false;
+    await click("#btn-retry-credentials");
+    await waitFor(() => !document.querySelector("[data-credential-error]"));
+    assert.equal(JSON.parse(savedSession).serviceToken, "fixture-token");
+    assert.match(tile("fixture-light"), /50%/);
+  });
+
   it("migrates old plaintext credentials into the credential manager and strips the copy", async () => {
     const store = new Map<string, string>();
     const invoke = async <T>(cmd: string, args: Record<string, unknown> = {}): Promise<T | null> => {
@@ -1341,9 +1573,9 @@ describe("Air purifier support (#98)", () => {
     );
 
     new MenuMijiaWindowsApp(element("#app"));
-    await waitFor(() => document.querySelectorAll(".cc-env-chip").length === 2);
+    await waitFor(() => document.querySelectorAll(".cc-env-chip:not(.is-power)").length === 1 && textOf(".cc-env-label") === "客厅");
     const chipLabels = Array.from(document.querySelectorAll(".cc-env-label"), (node) => node.textContent);
-    assert.deepEqual(chipLabels, ["客厅", "书房空净"]);
+    assert.deepEqual(chipLabels, ["客厅"]);
   });
 
   it("reuses the outer popover element and clears is-opening so clicks do not replay the drop-in animation", async () => {
@@ -1488,9 +1720,9 @@ describe("Home Assistant source", () => {
   function startHA(failedSnapshot = false, cached = failedSnapshot, token = "controlled-token"): { calls: string[]; failCommand: () => void } {
     const calls: string[] = [];
     let rejectCommand = false;
-    const invoke = async (name: string) => {
+    const invoke = async (name: string, args: Record<string, unknown> = {}) => {
       calls.push(name);
-      if (name === "secure_store_get") return token;
+      if (name === "secure_store_get") return args.name === "ha_token" ? token : null;
       if (name === "ha_snapshot") {
         if (failedSnapshot) throw new Error("Home Assistant disconnected");
         return structuredClone(fixture);
@@ -1507,8 +1739,8 @@ describe("Home Assistant source", () => {
     let isOn = false;
     let snapshots = 0;
     let effects: string[] = [];
-    const invoke = async (name: string) => {
-      if (name === "secure_store_get") return "controlled-token";
+    const invoke = async (name: string, args: Record<string, unknown> = {}) => {
+      if (name === "secure_store_get") return args.name === "ha_token" ? "controlled-token" : null;
       if (name === "ha_snapshot") {
         snapshots += 1;
         const next = structuredClone(fixture);
@@ -1559,8 +1791,8 @@ describe("Home Assistant source", () => {
   it("keeps focused thermostat controls when remote heating mode changes", async () => {
     let mode = "off";
     const snapshot = JSON.parse(readFileSync("../Tests/Fixtures/ha_regressions.json", "utf8"));
-    const invoke = async (name: string) => {
-      if (name === "secure_store_get") return "controlled-token";
+    const invoke = async (name: string, args: Record<string, unknown> = {}) => {
+      if (name === "secure_store_get") return args.name === "ha_token" ? "controlled-token" : null;
       if (name === "ha_snapshot") {
         const next = structuredClone(snapshot);
         next.states[0].state = mode;
@@ -1616,7 +1848,7 @@ describe("Home Assistant source", () => {
     const snapshot = JSON.parse(readFileSync("../Tests/Fixtures/ha_regressions.json", "utf8"));
     const modes: unknown[] = [];
     const invoke = async (name: string, args: Record<string, unknown> = {}) => {
-      if (name === "secure_store_get") return "controlled-token";
+      if (name === "secure_store_get") return args.name === "ha_token" ? "controlled-token" : null;
       if (name === "ha_snapshot") return snapshot;
       if (name === "ha_execute") {
         const call = args.command;
@@ -1639,8 +1871,8 @@ describe("Home Assistant source", () => {
   });
   it("retains cached cards and clears the independent HA error on reconnect", async () => {
     let failing = true;
-    const invoke = async (name: string) => {
-      if (name === "secure_store_get") return "controlled-token";
+    const invoke = async (name: string, args: Record<string, unknown> = {}) => {
+      if (name === "secure_store_get") return args.name === "ha_token" ? "controlled-token" : null;
       if (name === "ha_snapshot") {
         if (failing) throw new Error("Connection lost");
         return fixture;
@@ -1660,8 +1892,8 @@ describe("Home Assistant source", () => {
   });
   it("rejects malformed cached HA homes and refreshes into an empty state", async () => {
     let snapshots = 0;
-    const invoke = async (name: string) => {
-      if (name === "secure_store_get") return "controlled-token";
+    const invoke = async (name: string, args: Record<string, unknown> = {}) => {
+      if (name === "secure_store_get") return args.name === "ha_token" ? "controlled-token" : null;
       if (name === "ha_snapshot") { snapshots += 1; return structuredClone(fixture); }
       return undefined;
     };
@@ -1676,7 +1908,7 @@ describe("Home Assistant source", () => {
       const calls: Array<Record<string, unknown>> = [];
       let finish: () => void = () => {};
       const invoke = async (name: string, args: Record<string, unknown> = {}) => {
-        if (name === "secure_store_get") return "account-a";
+        if (name === "secure_store_get") return args.name === "ha_token" ? "account-a" : null;
         if (name === "ha_snapshot") return structuredClone(fixture);
         if (name === "ha_execute") {
           calls.push(args);
@@ -1744,8 +1976,8 @@ describe("Home Assistant source", () => {
   it("does not apply an old HA snapshot after switching to demo", async () => {
     let complete: (value: unknown) => void = () => assert.fail("Snapshot has not started");
     let snapshots = 0;
-    const invoke = async (name: string) => {
-      if (name === "secure_store_get") return "controlled-token";
+    const invoke = async (name: string, args: Record<string, unknown> = {}) => {
+      if (name === "secure_store_get") return args.name === "ha_token" ? "controlled-token" : null;
       if (name === "ha_snapshot") { snapshots += 1; return new Promise((resolve) => {complete = resolve;}); }
       return undefined;
     };
@@ -1766,8 +1998,8 @@ describe("Home Assistant source", () => {
   });
   it("patches HA value-only refreshes without replacing focused controls", async () => {
     let snapshots = 0;
-    const invoke = async (name: string) => {
-      if (name === "secure_store_get") return "controlled-token";
+    const invoke = async (name: string, args: Record<string, unknown> = {}) => {
+      if (name === "secure_store_get") return args.name === "ha_token" ? "controlled-token" : null;
       if (name === "ha_snapshot") {
         snapshots += 1;
         const next = structuredClone(fixture);

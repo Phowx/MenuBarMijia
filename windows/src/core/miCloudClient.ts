@@ -366,15 +366,15 @@ export class MiCloudClient {
   }
 
   static decodeResponse(body: string, statusCode: number, signedNonce: string): unknown {
-    if (statusCode === 401 || statusCode === 403) {
+    if (statusCode === 401) {
       throw new MiCloudError("sessionExpired", "米家登录已过期，请重新扫码");
+    }
+    if (statusCode !== 200) {
+      throw new MiCloudError("http", `米家云服务 HTTP ${statusCode}`, statusCode);
     }
     const plain = parseJsonObject(body);
     if (plain) {
       return MiCloudClient.unwrapResult(plain);
-    }
-    if (statusCode !== 200) {
-      throw new MiCloudError("http", `米家云服务 HTTP ${statusCode}`, statusCode);
     }
     let decryptedText: string;
     try {
@@ -390,32 +390,41 @@ export class MiCloudClient {
   }
 
   static unwrapResult(json: Record<string, unknown>): unknown {
-    const code = typeof json["code"] === "number" ? Math.trunc(json["code"]) : 0;
+    const code = json["code"];
+    if (typeof code !== "number" || !Number.isInteger(code)) {
+      throw new MiCloudError("badResponse", "米家云响应缺少有效状态码");
+    }
     const message =
       typeof json["message"] === "string"
         ? json["message"]
         : typeof json["desc"] === "string"
           ? json["desc"]
           : "";
-    if (code === 0) return json["result"] ?? null;
     const lower = message.toLowerCase();
     if (
       code === 2 ||
       code === 3 ||
       lower.includes("auth err") ||
       lower.includes("servicetoken_expired") ||
-      lower.includes("token expired") ||
-      lower.includes("invalid signature")
+      lower.includes("token expired")
     ) {
       throw new MiCloudError("sessionExpired", "米家登录已过期，请重新扫码", code);
     }
+    if (lower.includes("invalid signature")) {
+      throw new MiCloudError("badResponse", "米家云签名校验失败，请重试同步", code);
+    }
+    if (code === 0) return json["result"] ?? null;
     throw new MiCloudError("api", `米家云指令失败 (${code})：${message}`, code);
   }
 
   static parseDeviceList(result: unknown): MiDeviceRecord[] {
-    if (!result || typeof result !== "object") return [];
+    if (!result || typeof result !== "object") {
+      throw new MiCloudError("badResponse", "米家设备列表响应格式异常");
+    }
     const list = (result as Record<string, unknown>)["list"];
-    if (!Array.isArray(list)) return [];
+    if (!Array.isArray(list)) {
+      throw new MiCloudError("badResponse", "米家设备列表响应格式异常");
+    }
     const out: MiDeviceRecord[] = [];
     for (const item of list) {
       if (!item || typeof item !== "object") continue;
@@ -435,6 +444,9 @@ export class MiCloudClient {
         specType: typeof rec["spec_type"] === "string" ? rec["spec_type"] : null,
         ...(splitParentDid && splitSiid !== null ? { splitParentDid, splitSiid } : {}),
       });
+    }
+    if (list.length > 0 && out.length === 0) {
+      throw new MiCloudError("badResponse", "米家设备列表无法解析");
     }
     return out;
   }
@@ -548,17 +560,18 @@ export class MiCloudClient {
       const chunk = keys.slice(start, start + chunkSize);
       const params = chunk.map((k) => ({ did: k.did, siid: k.siid, piid: k.piid }));
       const result = await this.request("miotspec/prop/get", { params });
-      if (Array.isArray(result)) {
-        for (const item of result) {
-          if (!item || typeof item !== "object") continue;
-          const obj = item as Record<string, unknown>;
-          const did = asIdString(obj["did"]);
-          const siid = typeof obj["siid"] === "number" ? Math.trunc(obj["siid"]) : null;
-          const piid = typeof obj["piid"] === "number" ? Math.trunc(obj["piid"]) : null;
-          const code = typeof obj["code"] === "number" ? Math.trunc(obj["code"]) : 0;
-          if (did && siid !== null && piid !== null && code === 0 && "value" in obj) {
-            values.set(propKeyString({ did, siid, piid }), obj["value"]);
-          }
+      if (!Array.isArray(result)) {
+        throw new MiCloudError("badResponse", "米家设备状态响应格式异常");
+      }
+      for (const item of result) {
+        if (!item || typeof item !== "object") continue;
+        const obj = item as Record<string, unknown>;
+        const did = asIdString(obj["did"]);
+        const siid = typeof obj["siid"] === "number" ? Math.trunc(obj["siid"]) : null;
+        const piid = typeof obj["piid"] === "number" ? Math.trunc(obj["piid"]) : null;
+        const code = typeof obj["code"] === "number" ? Math.trunc(obj["code"]) : 0;
+        if (did && siid !== null && piid !== null && code === 0 && "value" in obj) {
+          values.set(propKeyString({ did, siid, piid }), obj["value"]);
         }
       }
     }
