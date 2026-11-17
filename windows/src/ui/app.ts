@@ -9,6 +9,7 @@ import {
   MI_CLOUD_REGIONS,
   MiAccountLogin,
   MiCloudClient,
+  MiCloudError,
   MiotCommandMapper,
   type MiotDeviceSpec,
   type MiotPropKey,
@@ -137,6 +138,7 @@ interface PersistedSettings {
   interfaceLanguage: LanguagePreference;
   /** °C/°F display (#52); stored/command values stay Celsius. */
   temperatureUnit: TemperatureUnitPreference;
+  environmentReadingId: string;
   /** Whether the system-wide tray shortcut is registered (#43). */
   enableGlobalHotkey: boolean;
   /** Canonical global shortcut string (default `"Alt+M"`, #43). */
@@ -160,7 +162,6 @@ interface ReplyBannerState {
   readonly text: string;
   readonly source: string;
   readonly isError?: boolean;
-  readonly isCloudSyncError?: boolean;
 }
 
 const STORAGE_KEY = "menumijia.windows.settings.v2";
@@ -500,6 +501,7 @@ function loadSettings(): LoadedSettings {
             parsed.temperatureUnit === "celsius" || parsed.temperatureUnit === "fahrenheit"
               ? parsed.temperatureUnit
               : "system",
+          environmentReadingId: typeof parsed.environmentReadingId === "string" ? parsed.environmentReadingId : "auto",
           enableGlobalHotkey: typeof parsed.enableGlobalHotkey === "boolean" ? parsed.enableGlobalHotkey : true,
           globalHotkey: normalizeGlobalShortcut(parsed.globalHotkey),
           cameraStreamURLs:
@@ -542,6 +544,7 @@ function loadSettings(): LoadedSettings {
       selectedHomeId: null,
       interfaceLanguage: "system",
       temperatureUnit: "system",
+      environmentReadingId: "auto",
       enableGlobalHotkey: true,
       globalHotkey: DEFAULT_GLOBAL_SHORTCUT,
       cameraStreamURLs: {},
@@ -644,6 +647,12 @@ export class MenuMijiaWindowsApp {
   private activeSheet: "none" | "onboarding" | "settings" = "none";
   private onboardingStep = 0;
   private replyBanner: ReplyBannerState | null = null;
+  private cloudError: { text: string; requiresLogin: boolean } | null = null;
+  private credentialError: string | null = null;
+  private credentialsReady = this.loadedSettings.hasLegacyCredentials;
+  private isLoadingCredentials = false;
+  private credentialRetryAt: number | null = null;
+  private credentialRetryDelayMs = 2_000;
   private haConnectionError: string | null = null;
   /** A command waiting for the user to allow sending it to a cloud AI service (#20). */
   private panelResize: {
@@ -713,6 +722,9 @@ export class MenuMijiaWindowsApp {
   private isRecordingHotkey = false;
   private hotkeyNeedsHint = false;
   private hotkeyRegistrationError: string | null = null;
+  private autostartEnabled: boolean | null = null;
+  private autostartBusy = false;
+  private autostartError: string | null = null;
 
   constructor(private readonly root: HTMLElement) {
     this.specResolver = new MiotSpecResolver(
@@ -771,9 +783,20 @@ export class MenuMijiaWindowsApp {
   }
 
   private async hydrateCredentials(): Promise<void> {
+    if (this.isLoadingCredentials) return;
+    this.isLoadingCredentials = true;
+    this.credentialRetryAt = null;
     try {
       const credentials = await this.credentialVault.load();
-      if (!hasCredentials(credentials)) return;
+      const hadError = this.credentialError !== null;
+      this.credentialsReady = true;
+      this.credentialError = null;
+      this.credentialRetryDelayMs = 2_000;
+      if (!hasCredentials(credentials)) {
+        if (hadError) this.queueBackgroundRender();
+        void this.persistCredentials();
+        return;
+      }
       const current = credentialsFromSettings(this.settings);
       if (!current.miSession && credentials.miSession) this.settings.miSession = credentials.miSession;
       if (current.haToken === "" && credentials.haToken !== "") this.settings.haToken = credentials.haToken;
@@ -798,22 +821,45 @@ export class MenuMijiaWindowsApp {
           this.environmentReadings = structuredClone(cache.home.environmentReadings);
         }
       }
-      this.render();
+      this.queueBackgroundRender();
       if (this.settings.connectionMode === "homeAssistant") void this.refreshHADevices();
+      void this.persistCredentials();
     } catch {
-      if (this.settings.connectionMode === "homeAssistant") {
-        this.haConnectionError = "Home Assistant credentials could not be loaded. Check Windows Credential Manager.";
-        this.render();
-      }
+      this.credentialsReady = false;
+      this.credentialError = t("暂时无法读取登录凭据，将自动重试。无需立即重新扫码。");
+      this.scheduleCredentialRetry();
+      this.queueBackgroundRender();
+    } finally {
+      this.isLoadingCredentials = false;
     }
   }
 
   private async persistCredentials(): Promise<void> {
+    // Preference saves during startup must not delete credentials still being loaded.
+    if (!this.credentialsReady) return;
     try {
       await this.credentialVault.persist(credentialsFromSettings(this.settings));
+      const hadError = this.credentialError !== null;
+      this.credentialError = null;
+      this.credentialRetryAt = null;
+      this.credentialRetryDelayMs = 2_000;
+      if (hadError) this.queueBackgroundRender();
     } catch {
-      // The credential manager refused the write; never fall back to plaintext storage.
+      this.credentialError = t("登录凭据尚未保存，将自动重试。当前会话仍可继续使用。");
+      this.scheduleCredentialRetry();
+      this.queueBackgroundRender();
     }
+  }
+
+  private scheduleCredentialRetry(): void {
+    this.credentialRetryAt = Date.now() + this.credentialRetryDelayMs;
+    this.credentialRetryDelayMs = Math.min(this.credentialRetryDelayMs * 2, 60_000);
+  }
+
+  private retryCredentials(): void {
+    this.credentialRetryAt = null;
+    if (this.credentialsReady) void this.persistCredentials();
+    else void this.hydrateCredentials();
   }
 
   private saveSettings(forceSubmitEndpoints = false): void {
@@ -853,6 +899,45 @@ export class MenuMijiaWindowsApp {
     this.activeSheet = "settings";
     invokeTauriVoid("set_pin_popover", { pin: true });
     this.render();
+    void this.readAutostart();
+  }
+
+  private async readAutostart(): Promise<void> {
+    const invoke = window.__TAURI_INTERNALS__?.invoke;
+    if (!invoke || this.autostartBusy) return;
+    this.autostartBusy = true;
+    this.autostartError = null;
+    if (this.activeSheet === "settings") this.render();
+    try {
+      const enabled = await invoke<boolean>("plugin:autostart|is_enabled");
+      if (typeof enabled !== "boolean") throw new Error("Autostart status unavailable");
+      this.autostartEnabled = enabled;
+    } catch {
+      this.autostartEnabled = null;
+      this.autostartError = t("无法读取开机自启状态");
+    } finally {
+      this.autostartBusy = false;
+      if (this.activeSheet === "settings") this.render();
+    }
+  }
+
+  private async setAutostart(enabled: boolean): Promise<void> {
+    const invoke = window.__TAURI_INTERNALS__?.invoke;
+    if (!invoke || this.autostartBusy) return;
+    this.autostartBusy = true;
+    this.autostartError = null;
+    this.render();
+    try {
+      await invoke(enabled ? "plugin:autostart|enable" : "plugin:autostart|disable");
+      const actual = await invoke<boolean>("plugin:autostart|is_enabled");
+      if (actual !== enabled) throw new Error("Autostart change was not applied");
+      this.autostartEnabled = actual;
+    } catch {
+      this.autostartError = t("开机自启设置失败，请重试");
+    } finally {
+      this.autostartBusy = false;
+      if (this.activeSheet === "settings") this.render();
+    }
   }
 
   private async applyGlobalHotkey(): Promise<void> {
@@ -936,6 +1021,9 @@ export class MenuMijiaWindowsApp {
       }
 
       const now = Date.now();
+      if (this.credentialRetryAt !== null && now >= this.credentialRetryAt && !this.isPollingQR) {
+        this.retryCredentials();
+      }
       let changed = false;
 
       if (this.lastUndoAction && this.lastUndoAction.expiresAtMs <= now) {
@@ -948,7 +1036,7 @@ export class MenuMijiaWindowsApp {
       }
 
       if (
-        (this.settings.connectionMode === "homeAssistant" || this.settings.connectionMode === "xiaomiCloud" && this.settings.miSession) &&
+        (this.settings.connectionMode === "homeAssistant" || this.settings.connectionMode === "xiaomiCloud" && this.settings.miSession && !this.cloudError?.requiresLogin) &&
         this.activeSheet === "none" &&
         !this.isSyncingCloud &&
         !this.isPollingQR &&
@@ -1111,7 +1199,7 @@ export class MenuMijiaWindowsApp {
     const stateRevisionAtStart = this.localControlRevision;
     const syncGen = ++this.syncGeneration;
     let presentationChanged = false;
-    let clearedSyncError = false;
+    let connectionChanged = false;
     this.isSyncingCloud = true;
     this.lastCloudRefreshAt = Date.now();
     if (!silent) {
@@ -1122,7 +1210,7 @@ export class MenuMijiaWindowsApp {
       const client = new MiCloudClient(session, this.transport);
       const [allDevices, allRooms] = await Promise.all([
         client.deviceList(),
-        client.homeRooms().catch(() => []),
+        client.homeRooms(),
       ]);
       const nextHomes = homeOptions(allRooms);
       if (this.cloudSnapshotIsStale(session, stateRevisionAtStart)) return;
@@ -1155,7 +1243,7 @@ export class MenuMijiaWindowsApp {
 
       const values =
         propKeys.length > 0
-          ? await client.getProps(propKeys).catch(() => new Map<string, unknown>())
+          ? await client.getProps(propKeys)
           : new Map<string, unknown>();
 
       const home = MiotSynthesizer.synthesize(rawDevices, rooms, specs, values);
@@ -1186,26 +1274,25 @@ export class MenuMijiaWindowsApp {
         this.saveSettings();
       }
 
-      if (this.replyBanner?.isCloudSyncError) {
-        this.replyBanner = null;
-        clearedSyncError = true;
+      if (this.cloudError) {
+        this.cloudError = null;
+        connectionChanged = true;
       }
     } catch (err) {
-      if (!silent && this.syncGeneration === syncGen && !this.cloudSnapshotIsStale(session, stateRevisionAtStart)) {
+      if (this.syncGeneration === syncGen && !this.cloudSnapshotIsStale(session, stateRevisionAtStart)) {
         const msg = err instanceof Error ? err.message : String(err);
-        this.replyBanner = {
+        this.cloudError = {
           text: t("米家云同步失败：{message}", { message: msg }),
-          source: t("连接异常"),
-          isError: true,
-          isCloudSyncError: true,
+          requiresLogin: err instanceof MiCloudError && err.kind === "sessionExpired",
         };
+        connectionChanged = true;
       }
     } finally {
       if (this.syncGeneration === syncGen) {
         this.isSyncingCloud = false;
         if (!silent) {
           this.render();
-        } else if (clearedSyncError) {
+        } else if (connectionChanged) {
           this.queueBackgroundRender();
         } else if (presentationChanged) {
           if (
@@ -1674,6 +1761,7 @@ export class MenuMijiaWindowsApp {
     this.syncGeneration += 1;
     this.isSyncingCloud = false;
     this.haConnectionError = null;
+    this.cloudError = null;
     this.lastUndoAction = null;
     this.replyBanner = null;
   }
@@ -1944,6 +2032,7 @@ export class MenuMijiaWindowsApp {
   private get statusSummaryText(): string {
     if (this.settings.connectionMode === "homeAssistant") return this.isSyncingCloud ? "Home Assistant · Connecting" : `Home Assistant · ${this.onlineDeviceCount} online`;
     if (this.settings.connectionMode === "xiaomiCloud") {
+      if (this.cloudError) return t("同步异常 · 显示上次设备状态");
       if (this.isSyncingCloud && this.devices.length === 0) {
         return t("正在从小米云端同步真实设备...");
       }
@@ -2159,6 +2248,16 @@ export class MenuMijiaWindowsApp {
             </div>` : ""}
         </section>` : ""}
 
+        ${this.credentialError ? `<section class="cc-search-section"><div class="cc-feedback-card is-error" role="alert" data-credential-error>
+          <div class="cc-feedback-row"><span class="cc-feedback-text">${this.escapeHtml(this.credentialError)}</span>
+          <button class="cc-inline-pill" id="btn-retry-credentials">${t("重试")}</button></div>
+        </div></section>` : ""}
+        ${this.cloudError && this.settings.connectionMode === "xiaomiCloud" ? `<section class="cc-search-section"><div class="cc-feedback-card is-error" role="alert" data-cloud-error>
+          <div class="cc-feedback-row"><span class="cc-feedback-text">${this.escapeHtml(this.cloudError.text)}</span>
+          <button class="cc-inline-pill" id="btn-cloud-resync">${t("重新同步设备")}</button>
+          ${this.cloudError.requiresLogin ? `<button class="cc-inline-pill" id="btn-cloud-rescan">${t("扫码直连")}</button>` : ""}</div>
+        </div></section>` : ""}
+
         ${this.haConnectionError ? `<div class="cc-feedback-card is-error" role="alert" data-ha-error><span class="cc-feedback-badge">Home Assistant</span><span class="cc-feedback-text">${this.escapeHtml(this.haConnectionError)}</span></div>` : ""}
 
         <section class="cc-quick-strip">
@@ -2213,7 +2312,7 @@ export class MenuMijiaWindowsApp {
 
         <footer class="cc-footer">
           <div class="cc-footer-status">
-            <span class="cc-status-dot ${this.isSyncingCloud ? "is-syncing" : this.settings.connectionMode === "homeAssistant" ? (this.haConnectionError || !this.settings.haBaseURL || !this.settings.haToken ? "is-demo" : "is-online") : isDemo ? "is-demo" : "is-online"}"></span>
+            <span class="cc-status-dot ${this.isSyncingCloud ? "is-syncing" : this.settings.connectionMode === "xiaomiCloud" && this.cloudError ? "is-error" : this.settings.connectionMode === "homeAssistant" ? (this.haConnectionError || !this.settings.haBaseURL || !this.settings.haToken ? "is-demo" : "is-online") : isDemo ? "is-demo" : "is-online"}"></span>
             <span class="cc-footer-label">
               ${
                 this.settings.connectionMode === "xiaomiCloud" && this.settings.miSession
@@ -2291,7 +2390,11 @@ export class MenuMijiaWindowsApp {
   }
 
   private renderEnvironmentStrip(): string {
-    const envChips = this.computedEnvironmentReadings;
+    const readings = this.computedEnvironmentReadings;
+    const selected = readings.find((reading) => reading.id === this.settings.environmentReadingId)
+      ?? readings.find((reading) => reading.temperature !== null)
+      ?? readings[0];
+    const envChips = this.settings.environmentReadingId === "none" || !selected ? [] : [selected];
     const watts = this.totalPowerWatts;
     if (envChips.length === 0 && watts < 1) return "";
     return `
@@ -3491,6 +3594,26 @@ export class MenuMijiaWindowsApp {
           </div>
 
           <div class="cc-field">
+            <label for="settings-environment-reading">${t("顶部温湿度")}</label>
+            <select class="cc-input" id="settings-environment-reading">
+              <option value="auto" ${this.settings.environmentReadingId === "auto" ? "selected" : ""}>${t("自动选择主要传感器")}</option>
+              <option value="none" ${this.settings.environmentReadingId === "none" ? "selected" : ""}>${t("不显示温湿度")}</option>
+              ${this.computedEnvironmentReadings.map((reading) => `<option value="${this.escapeHtml(reading.id)}" ${this.settings.environmentReadingId === reading.id ? "selected" : ""}>${this.escapeHtml(reading.label)}</option>`).join("")}
+              ${!["auto", "none"].includes(this.settings.environmentReadingId) && !this.computedEnvironmentReadings.some((reading) => reading.id === this.settings.environmentReadingId)
+                ? `<option value="${this.escapeHtml(this.settings.environmentReadingId)}" selected>${t("已选设备暂不可用，暂用主要传感器")}</option>` : ""}
+            </select>
+          </div>
+
+          <div class="cc-field">
+            <div class="cc-field-row">
+              <label for="settings-autostart">${t("开机自启")}</label>
+              <input type="checkbox" id="settings-autostart" ${this.autostartEnabled === true ? "checked" : ""} ${this.autostartBusy || this.autostartEnabled === null ? "disabled" : ""} />
+            </div>
+            <p class="cc-field-hint">${t("登录 Windows 后在托盘启动")}</p>
+            ${this.autostartError ? `<p class="cc-field-hint" role="alert">${this.escapeHtml(this.autostartError)}</p><button class="cc-btn-secondary" id="btn-retry-autostart">${t("重试")}</button>` : ""}
+          </div>
+
+          <div class="cc-field">
             <label class="cc-checkbox">
               <input type="checkbox" id="settings-hide-offline" ${this.layout.hideOfflineDevices === true ? "checked" : ""} />
               <span>${t("隐藏离线设备")}</span>
@@ -3634,6 +3757,21 @@ export class MenuMijiaWindowsApp {
   }
 
   private bindEvents(): void {
+    this.root.querySelector("#btn-retry-credentials")?.addEventListener("click", () => this.retryCredentials());
+    this.root.querySelector("#btn-cloud-resync")?.addEventListener("click", () => { void this.refreshDevices(false); });
+    this.root.querySelector("#btn-cloud-rescan")?.addEventListener("click", () => {
+      this.activeSheet = "onboarding";
+      void this.startXiaomiQRLogin();
+    });
+    this.root.querySelector<HTMLInputElement>("#settings-autostart")?.addEventListener("change", (event) => {
+      void this.setAutostart((event.currentTarget as HTMLInputElement).checked);
+    });
+    this.root.querySelector("#btn-retry-autostart")?.addEventListener("click", () => { void this.readAutostart(); });
+    this.root.querySelector<HTMLSelectElement>("#settings-environment-reading")?.addEventListener("change", (event) => {
+      this.settings.environmentReadingId = (event.currentTarget as HTMLSelectElement).value;
+      this.saveSettings();
+      this.render();
+    });
     this.root.querySelector("#btn-device-search")?.addEventListener("click", () => {
       this.setDeviceSearchOpen(!this.isDeviceSearchOpen);
     });
@@ -3920,7 +4058,9 @@ export class MenuMijiaWindowsApp {
     });
 
     this.root.querySelector("#btn-refresh")?.addEventListener("click", () => {
-      if (this.settings.connectionMode === "homeAssistant" || this.settings.connectionMode === "xiaomiCloud" && this.settings.miSession) {
+      if (!this.credentialsReady) {
+        this.retryCredentials();
+      } else if (this.settings.connectionMode === "homeAssistant" || this.settings.connectionMode === "xiaomiCloud" && this.settings.miSession) {
         void this.refreshDevices(false);
       } else {
         this.render();

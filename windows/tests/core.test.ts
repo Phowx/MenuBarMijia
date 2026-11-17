@@ -27,6 +27,7 @@ import {
   MI_CLOUD_REGIONS,
   MiAccountLogin,
   MiCloudClient,
+  MiCloudError,
   MiotCommandMapper,
   MiotSpecResolver,
   MiotSynthesizer,
@@ -149,6 +150,43 @@ describe("MiCloudCrypto", () => {
   });
 });
 
+describe("Xiaomi cloud response failures", () => {
+  it("rejects a zero-code signature failure instead of producing an empty list", () => {
+    assert.throws(
+      () => MiCloudClient.decodeResponse(JSON.stringify({ code: 0, message: "invalid signature" }), 200, Vectors.signedNonce),
+      (error: unknown) => error instanceof MiCloudError && error.kind === "badResponse",
+    );
+  });
+
+  it("recognizes explicit expiry even when the envelope says code zero", () => {
+    for (const response of [{ code: 3 }, { code: 0, message: "SERVICETOKEN_EXPIRED" }]) {
+      assert.throws(
+        () => MiCloudClient.decodeResponse(JSON.stringify(response), 200, Vectors.signedNonce),
+        (error: unknown) => error instanceof MiCloudError && error.kind === "sessionExpired",
+      );
+    }
+  });
+
+  it("rejects HTTP failures before trusting a JSON success envelope", () => {
+    for (const status of [401, 403, 429, 500, 503]) {
+      assert.throws(
+        () => MiCloudClient.decodeResponse(Vectors.respPlain, status, Vectors.signedNonce),
+        (error: unknown) => error instanceof MiCloudError && error.kind === (status === 401 ? "sessionExpired" : "http"),
+      );
+    }
+  });
+
+  it("distinguishes malformed device lists from a valid empty home", () => {
+    for (const value of [null, {}, { list: null }, { list: {} }, { list: [null, {}] }]) {
+      assert.throws(() => MiCloudClient.parseDeviceList(value), MiCloudError);
+    }
+    assert.deepEqual(MiCloudClient.parseDeviceList({ list: [] }), []);
+    for (const code of [undefined, null, "0", 0.5]) {
+      assert.throws(() => MiCloudClient.unwrapResult({ code, result: { list: [] } }), MiCloudError);
+    }
+  });
+});
+
 describe("Secure credential storage (#28 / #27 / #49)", () => {
   const session = {
     userId: "100",
@@ -243,6 +281,55 @@ describe("Secure credential storage (#28 / #27 / #49)", () => {
 
     await vault.persist(loaded);
     assert.equal(calls.some((call) => call.cmd === "secure_store_set"), false);
+  });
+
+  it("preserves unread credentials after a partial read failure and allows a later retry", async () => {
+    let fail = true;
+    const writes: string[] = [];
+    const vault = new CredentialVault(async <T>(cmd: string, args: Record<string, unknown>): Promise<T | null> => {
+      const name = String(args.name);
+      if (cmd !== "secure_store_get") { writes.push(cmd); return null; }
+      if (name === "ha_token" && fail) throw new Error("Credential manager temporarily unavailable");
+      return (name === "mi_session" ? serializeMiSession(session) : null) as T | null;
+    });
+    await assert.rejects(vault.load());
+    await assert.rejects(vault.persist({ miSession: null, haToken: "", assistantApiKey: "" }));
+    assert.deepEqual(writes, []);
+    fail = false;
+    const loaded = await vault.load();
+    assert.equal(loaded.miSession?.userId, session.userId);
+    await vault.persist(loaded);
+    assert.deepEqual(writes, []);
+  });
+
+  it("does not overwrite an unreadable saved session", async () => {
+    const { vault, calls, store } = recordingVault({ mi_session: "invalid saved JSON" });
+    await assert.rejects(vault.load());
+    await assert.rejects(vault.persist({ miSession: null, haToken: "", assistantApiKey: "" }));
+    assert.equal(store.get("mi_session"), "invalid saved JSON");
+    assert.ok(calls.every((call) => call.cmd === "secure_store_get"));
+  });
+
+  it("serializes overlapping saves so an old write cannot replace a new session", async () => {
+    let release!: () => void;
+    let started!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const writing = new Promise<void>((resolve) => { started = resolve; });
+    let saved = "";
+    const vault = new CredentialVault(async (cmd, args) => {
+      if (cmd === "secure_store_set" && args.name === "mi_session") {
+        const value = String(args.value);
+        if (value.includes("old-session")) { started(); await gate; }
+        saved = value;
+      }
+      return null;
+    });
+    const first = vault.persist({ miSession: { ...session, serviceToken: "old-session" }, haToken: "", assistantApiKey: "" });
+    await writing;
+    const second = vault.persist({ miSession: { ...session, serviceToken: "new-session" }, haToken: "", assistantApiKey: "" });
+    release();
+    await Promise.all([first, second]);
+    assert.equal(parseMiSession(saved)?.serviceToken, "new-session");
   });
 
   it("uses Web Crypto, not Math.random, for the MIoT nonce (#49)", () => {

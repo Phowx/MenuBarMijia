@@ -167,36 +167,52 @@ export async function secureStoreDelete(
  */
 export class CredentialVault {
   private readonly known = new Map<SecureCredentialName, string>();
+  private operations: Promise<unknown> = Promise.resolve();
+  private readFailed = false;
 
   constructor(private readonly invoke: SecureInvoke = tauriInvoke) {}
 
   async load(): Promise<CredentialSnapshot> {
-    const [sessionRaw, haToken, assistantApiKey] = await Promise.all([
-      secureStoreGet("mi_session", this.invoke).catch(() => null),
-      secureStoreGet("ha_token", this.invoke).catch(() => null),
-      secureStoreGet("assistant_api_key", this.invoke).catch(() => null),
-    ]);
-    const miSession = parseMiSession(sessionRaw);
-    const snapshot: CredentialSnapshot = {
-      miSession,
-      haToken: haToken ?? "",
-      assistantApiKey: assistantApiKey ?? "",
-    };
-    this.remember("mi_session", miSession ? serializeMiSession(miSession) : "");
-    this.remember("ha_token", snapshot.haToken);
-    this.remember("assistant_api_key", snapshot.assistantApiKey);
-    return snapshot;
+    return this.enqueue(async () => {
+      this.readFailed = true;
+      const [sessionRaw, haToken, assistantApiKey] = await Promise.all([
+        secureStoreGet("mi_session", this.invoke),
+        secureStoreGet("ha_token", this.invoke),
+        secureStoreGet("assistant_api_key", this.invoke),
+      ]);
+      const miSession = parseMiSession(sessionRaw);
+      if (sessionRaw && !miSession) throw new Error("Saved Xiaomi session could not be parsed");
+      const snapshot: CredentialSnapshot = {
+        miSession,
+        haToken: haToken ?? "",
+        assistantApiKey: assistantApiKey ?? "",
+      };
+      this.remember("mi_session", miSession ? serializeMiSession(miSession) : "");
+      this.remember("ha_token", snapshot.haToken);
+      this.remember("assistant_api_key", snapshot.assistantApiKey);
+      this.readFailed = false;
+      return snapshot;
+    });
   }
 
   /** Rejects when the credential manager refused a write; callers must not retry via plaintext. */
   async persist(credentials: CredentialSnapshot): Promise<void> {
-    const results = await Promise.allSettled([
-      this.sync("mi_session", credentials.miSession ? serializeMiSession(credentials.miSession) : ""),
-      this.sync("ha_token", credentials.haToken),
-      this.sync("assistant_api_key", credentials.assistantApiKey),
-    ]);
-    const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
-    if (failure) throw failure.reason;
+    return this.enqueue(async () => {
+      if (this.readFailed) throw new Error("Credential store must be read successfully before writing");
+      const results = await Promise.allSettled([
+        this.sync("mi_session", credentials.miSession ? serializeMiSession(credentials.miSession) : ""),
+        this.sync("ha_token", credentials.haToken),
+        this.sync("assistant_api_key", credentials.assistantApiKey),
+      ]);
+      const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+      if (failure) throw failure.reason;
+    });
+  }
+
+  private enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    const next = this.operations.then(operation);
+    this.operations = next.catch(() => undefined);
+    return next;
   }
 
   private remember(name: SecureCredentialName, value: string): void {

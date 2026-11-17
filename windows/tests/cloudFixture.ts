@@ -42,6 +42,8 @@ export function cloudFixture(intents: readonly DeviceIntent[]) {
   const rejectedValues = new Map<number, unknown>([[2, 80]]);
   let completedReads = 0;
   let deviceListFails = false;
+  const responseOverrides = new Map<string, HttpResponse>();
+  const requests: string[] = [];
   let readGate: {
     readonly promise: Promise<void>;
     readonly started: Promise<void>;
@@ -54,6 +56,10 @@ export function cloudFixture(intents: readonly DeviceIntent[]) {
     if (name !== "native_http") return;
     assert.equal(typeof args.url, "string");
     const url = String(args.url);
+    requests.push(url);
+    for (const [path, response] of responseOverrides) {
+      if (url.includes(path)) return response;
+    }
     if (url.includes("/instance?")) return { status: 200, headers: {}, body: JSON.stringify(url.includes("temperature-humidity-sensor") ? sensorSpec : spec) };
     if (url.includes("/instances?")) return { status: 200, headers: {}, body: JSON.stringify({ instances: [{ model, type: spec.type }] }) };
     let result: unknown = {};
@@ -115,7 +121,12 @@ export function cloudFixture(intents: readonly DeviceIntent[]) {
     sensorValues,
     sensorRecord: (did: string, name: string) => ({ did, name, model: sensorModel, isOnline: true, spec_type: sensorSpec.type }),
     writes,
+    requests,
     setDeviceListFailure: (fails: boolean) => { deviceListFails = fails; },
+    setResponse: (path: string, response: HttpResponse | null) => {
+      if (response) responseOverrides.set(path, response);
+      else responseOverrides.delete(path);
+    },
     completedReads: () => completedReads,
     /** Captures the next property read's values, then waits until the test releases the response. */
     holdNextRead: () => {

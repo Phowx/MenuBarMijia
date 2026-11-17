@@ -14,6 +14,17 @@ export type LanguagePreference = "system" | AppLanguage;
 
 /** Chinese key → [Simplified Chinese, English]. */
 const CATALOG: Readonly<Record<string, readonly [string, string]>> = {
+  "同步异常 · 显示上次设备状态": ["同步异常 · 显示上次设备状态", "Sync failed · Showing last known device states"],
+  "暂时无法读取登录凭据，将自动重试。无需立即重新扫码。": ["暂时无法读取登录凭据，将自动重试。无需立即重新扫码。", "Saved credentials are temporarily unavailable. Retrying automatically. You do not need to scan again yet."],
+  "登录凭据尚未保存，将自动重试。当前会话仍可继续使用。": ["登录凭据尚未保存，将自动重试。当前会话仍可继续使用。", "Credentials could not be saved. Retrying automatically. Your current session is still available."],
+  "开机自启": ["开机自启", "Launch at login"],
+  "登录 Windows 后在托盘启动": ["登录 Windows 后在托盘启动", "Start in the tray when you sign in to Windows"],
+  "无法读取开机自启状态": ["无法读取开机自启状态", "Unable to read startup status"],
+  "开机自启设置失败，请重试": ["开机自启设置失败，请重试", "Unable to change startup settings. Try again."],
+  "顶部温湿度": ["顶部温湿度", "Header temperature and humidity"],
+  "自动选择主要传感器": ["自动选择主要传感器", "Automatically choose a primary sensor"],
+  "不显示温湿度": ["不显示温湿度", "Hide temperature and humidity"],
+  "已选设备暂不可用，暂用主要传感器": ["已选设备暂不可用，暂用主要传感器", "Selected device unavailable. Using the primary sensor."],
   "搜索设备或房间": ["搜索设备或房间", "Search devices or rooms"],
   "搜索设备或房间 (Ctrl+F)": ["搜索设备或房间 (Ctrl+F)", "Search devices or rooms (Ctrl+F)"],
   "隐藏此设备": ["隐藏此设备", "Hide device"],
