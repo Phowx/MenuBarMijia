@@ -41,11 +41,11 @@ enum KeychainUpgradeNotice {
         alert.informativeText = L10n.tr(
             "接下来 macOS 会询问是否允许 MenuBarMijia 使用钥匙串里保存的登录信息。"
                 + "\n\n请输入这台 Mac 的登录密码，然后点「始终允许」。" + howMany
-                + "\n\n如果点「拒绝」，App 会显示为未登录，但保存的登录信息不会被删除，下次启动会再询问。",
+                + "\n\n如果点「拒绝」，App 会提示凭据暂时不可读取，保存的登录信息不会被删除。可在连接设置中重试读取，下次启动也会再询问。",
             "Next, macOS will ask whether MenuBarMijia may use the sign-in details saved in your Keychain."
                 + "\n\nEnter this Mac's login password, then click \u{201C}Always Allow\u{201D}. " + howMany
-                + "\n\nIf you click \u{201C}Deny\u{201D}, the app shows as signed out, but your saved sign-in details "
-                + "are not deleted and you will be asked again at the next launch."
+                + "\n\nIf you click \u{201C}Deny\u{201D}, the app reports that credentials are unavailable. Your saved "
+                + "details are preserved. Retry reading them in Connection Settings, or relaunch to be asked again."
         )
         alert.addButton(withTitle: L10n.tr("继续", "Continue"))
         NSApp.activate()

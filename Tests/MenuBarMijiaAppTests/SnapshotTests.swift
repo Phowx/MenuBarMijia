@@ -295,6 +295,35 @@ struct SnapshotTests {
         #expect(text.contains("已连接 Home Assistant"))
     }
 
+    @Test("Connection recovery wraps long causes and exposes the appropriate actions at minimum width")
+    func connectionRecoverySnapshots() {
+        let previous = L10n.currentLanguage
+        defer { L10n.currentLanguage = previous }
+        for language in [AppLanguage.zhHans, .en] {
+            L10n.currentLanguage = language
+            let cases: [(String, ConnectionIssue, Bool)] = [
+                ("sync", ConnectionIssue(
+                    message: L10n.tr("米家云服务暂时无法返回有效设备列表，将自动重试。HTTP 503，请检查网络后重试同步，无需重新扫码。", "Xiaomi Cloud could not return a valid device list. HTTP 503. Automatic retries continue. Check your connection and retry syncing; you do not need to scan again."),
+                    recovery: .retrySync), true),
+                ("credentials", ConnectionIssue(
+                    message: CredentialStoreError.unavailable.localizedDescription,
+                    recovery: .retryCredentials), false),
+                ("expired", ConnectionIssue(
+                    message: MiCloudError.sessionExpired.localizedDescription,
+                    recovery: .signIn), true)
+            ]
+            for (name, issue, cached) in cases {
+                assertRendered(
+                    snapshotReady(ConnectionRecoveryBanner(
+                        issue: issue, showsCachedState: cached, retry: {}, openConnection: {}
+                    ).padding(13).frame(width: 340)),
+                    size: CGSize(width: 340, height: 240),
+                    named: "connection-\(name)-\(language.rawValue)"
+                )
+            }
+        }
+    }
+
     // MARK: - Rendering switches
 
     private func snapshotReady<V: View>(_ view: V, scheme: ColorScheme = .light) -> some View {

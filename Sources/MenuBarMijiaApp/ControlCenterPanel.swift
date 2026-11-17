@@ -199,6 +199,18 @@ public struct ControlCenterPanel: View {
                     )
 
                     VStack(alignment: .leading, spacing: 11) {
+                        if let issue = store.visibleConnectionIssue {
+                            ConnectionRecoveryBanner(
+                                issue: issue,
+                                showsCachedState: !store.connectionStatus.isConnected && !store.devices.isEmpty,
+                                lastUpdate: store.lastSnapshotAt,
+                                retry: {
+                                    if issue.recovery == .retryCredentials { store.retryCredentials() }
+                                    else { store.refreshNow() }
+                                },
+                                openConnection: { SettingsWindowOpener.shared.show(tab: .connection) }
+                            )
+                        }
                         if search.isSearching {
                             searchResultsList(results: searchResults)
                         } else if store.filteredDevices.isEmpty {
@@ -1378,16 +1390,14 @@ public struct ControlCenterPanel: View {
                 .foregroundStyle(.secondary)
             if case .disconnected = store.connectionStatus {
                 Text(
-                    store.homeBackend == .xiaomiCloud
-                        ? L10n.tr("尚未登录米家云端账号", "Not signed in to Xiaomi Cloud")
-                        : L10n.tr("尚未连接到 Home Assistant", "Not connected to Home Assistant")
+                    store.visibleConnectionIssue?.recovery == .signIn
+                        ? L10n.tr("请在连接设置中扫码登录", "Sign in from Connection Settings")
+                        : L10n.tr("暂时无法同步设备", "Device sync is unavailable")
                 )
                     .font(.system(size: DesignTokens.TypeSize.body, weight: .semibold))
                     .foregroundStyle(.primary)
                 Text(
-                    store.homeBackend == .xiaomiCloud
-                        ? L10n.tr("无需额外部署服务器，使用手机「米家」App 扫码即可同步设备", "Scan with the Mi Home app on your phone to sync devices without a server")
-                        : L10n.tr("点击下方按钮配置服务器地址与令牌，或切换为手机米家扫码直连", "Configure your server URL and token below, or switch to Xiaomi Cloud QR login")
+                    L10n.tr("请查看上方的具体原因与恢复操作。", "See the cause and recovery actions above.")
                 )
                     .font(.system(size: DesignTokens.TypeSize.caption))
                     .foregroundStyle(.secondary)
@@ -1640,6 +1650,9 @@ public struct ControlCenterPanel: View {
         case .connecting:
             return L10n.tr("正在连接 (\(store.serverHostSummary))…", "Connecting (\(store.serverHostSummary))…")
         case .disconnected(let reason):
+            if store.visibleConnectionIssue != nil {
+                return L10n.tr("连接异常 · 详情见上方", "Connection issue · See details above")
+            }
             return L10n.tr("未连接：\(reason)", "Disconnected: \(reason)")
         }
     }

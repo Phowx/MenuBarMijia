@@ -488,6 +488,9 @@ private struct ConnectionSettingsTab: View {
         let _ = store.effectiveLanguage
         ScrollView(.vertical, showsIndicators: true) {
             VStack(alignment: .leading, spacing: 16) {
+                if let issue = store.credentialIssue {
+                    ConnectionRecoveryBanner(issue: issue, retry: { store.retryCredentials() })
+                }
                 SettingsSection(title: L10n.tr("连接配置", "Connection")) {
                     HStack {
                         Text(store.homeBackend == .demo
@@ -617,6 +620,7 @@ private struct ConnectionSettingsTab: View {
                                 store.updateConnection(serverURL: urlDraft, token: tokenDraft)
                             }
                             .buttonStyle(PillActionButtonStyle(isSelected: true, tintColor: .accentColor))
+                            .disabled(store.credentialsNeedReading && tokenDraft.isEmpty)
                         }
                         .padding(.top, 2)
                     } else if store.homeBackend == .xiaomiCloud {
@@ -632,7 +636,7 @@ private struct ConnectionSettingsTab: View {
         }
         .onAppear {
             urlDraft = store.serverURLString
-            tokenDraft = KeychainHelper.loadToken()
+            tokenDraft = store.haTokenForCurrentSession
             if store.discoveredHAInstances.isEmpty {
                 Task {
                     let found = await store.discoverHomeAssistantOnLAN(autoApplyIfDefault: true)
@@ -642,6 +646,9 @@ private struct ConnectionSettingsTab: View {
                     }
                 }
             }
+        }
+        .onChange(of: store.credentialsNeedReading) { _, blocked in
+            if !blocked, tokenDraft.isEmpty { tokenDraft = store.haTokenForCurrentSession }
         }
     }
 

@@ -154,6 +154,8 @@ struct MijiaCoreTests {
                 if case .disconnected = status {
                     return
                 }
+            case .connectionIssue:
+                continue
             case .snapshotUpdated(let home):
                 receivedHome = home
                 break

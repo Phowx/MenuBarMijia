@@ -84,6 +84,13 @@ public final class CredentialVault: @unchecked Sendable {
         }
     }
 
+    /// Explicit recovery only: ordinary reads never repeat a declined authorization prompt.
+    public func retryReading() {
+        lock.lock()
+        defer { lock.unlock() }
+        loadIfNeeded(retryingUnavailable: true)
+    }
+
     func data(for account: String) -> Data? {
         if case .value(let data) = lookup(account) { return data }
         return nil

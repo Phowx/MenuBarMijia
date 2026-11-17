@@ -42,6 +42,11 @@ public final class HomeStore {
     public static let shared = HomeStore()
 
     public internal(set) var connectionStatus: ConnectionStatus = .connecting
+    public internal(set) var connectionIssue: ConnectionIssue?
+    /// Kept separate so a successful network refresh cannot hide a failed credential save.
+    public internal(set) var credentialIssue: ConnectionIssue?
+    public internal(set) var credentialsNeedReading = false
+    public internal(set) var lastSnapshotAt: Date?
     public internal(set) var rooms: [RoomArea] = []
     /// Mi Home 家庭 list from the cloud backend; empty elsewhere.
     public internal(set) var homes: [HomeOption] = []
@@ -141,10 +146,11 @@ public final class HomeStore {
 
     public var shouldShowOnboarding: Bool {
         if isShowingOnboarding { return true }
+        if credentialIssue != nil { return false }
         guard !hasCompletedOnboarding, devices.isEmpty else { return false }
         if case .connected = connectionStatus { return false }
         let hasMiSession = (miSessionMaskedUserId != nil)
-        let hasHAToken = !KeychainHelper.loadToken(defaults: userDefaults).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let hasHAToken = !((try? KeychainHelper.loadTokenChecked(defaults: userDefaults, vault: credentialVault)) ?? "").isEmpty
         return !hasMiSession && !hasHAToken
     }
 
@@ -173,6 +179,11 @@ public final class HomeStore {
     }
 
     public internal(set) var miSessionMaskedUserId: String?
+    var activeMiSession: MiSession?
+    var pendingMiSession: MiSession?
+    var pendingHAToken: String?
+    let credentialVault: CredentialVault?
+    let cloudAPIFactory: MiCloudProvider.APIFactory
     var miSessionScopeIdentifier: String? {
         didSet { syncSensorHistoryScope() }
     }
@@ -239,10 +250,14 @@ public final class HomeStore {
     public init(
         provider: (any HomeProvider)? = nil,
         defaultsSuiteName: String? = nil,
-        updater: AppUpdater? = nil
+        updater: AppUpdater? = nil,
+        credentialVault: CredentialVault? = nil,
+        cloudAPIFactory: @escaping MiCloudProvider.APIFactory = { MiCloudClient(session: $0) }
     ) {
         let ud = defaultsSuiteName.flatMap { UserDefaults(suiteName: $0) } ?? .standard
         self.userDefaults = ud
+        self.credentialVault = credentialVault
+        self.cloudAPIFactory = cloudAPIFactory
         let isTestEnvironment = (provider != nil || defaultsSuiteName != nil)
         self.isTestEnvironment = isTestEnvironment
         self.updater = updater ?? AppUpdater()
@@ -268,7 +283,9 @@ public final class HomeStore {
             L10n.currentLanguage = initialEffective
         }
 
-        let initialMiSession = MiSessionStore.load(defaults: ud)
+        let miSessionResult = Result { try MiSessionStore.loadChecked(defaults: ud, vault: credentialVault) }
+        let initialMiSession = try? miSessionResult.get()
+        self.activeMiSession = initialMiSession
         let savedRegion = ud.string(forKey: "mi_cloud_region").flatMap(MiCloudRegion.init(rawValue:))
             ?? initialMiSession.flatMap { MiCloudRegion(rawValue: $0.region.lowercased()) }
             ?? .cn
@@ -319,12 +336,22 @@ public final class HomeStore {
         }
         self.allOffOverrides = ud.dictionary(forKey: "all_off_overrides") as? [String: Bool] ?? [:]
 
-        let initialHAToken = (provider == nil && initialBackend == .homeAssistant) ? KeychainHelper.loadToken(defaults: ud) : ""
+        let haTokenResult = Result { try KeychainHelper.loadTokenChecked(defaults: ud, vault: credentialVault) }
+        let initialHAToken = (try? haTokenResult.get()) ?? ""
+        if initialBackend == .xiaomiCloud, case .failure(let error) = miSessionResult {
+            self.credentialIssue = ConnectionIssue(error: error)
+            self.credentialsNeedReading = true
+        } else if initialBackend == .homeAssistant, case .failure(let error) = haTokenResult {
+            self.credentialIssue = ConnectionIssue(error: error)
+            self.credentialsNeedReading = true
+        }
         if let provider {
             self.provider = provider
         } else if initialBackend == .xiaomiCloud {
-            nonisolated(unsafe) let ud = userDefaults
-            self.provider = MiCloudProvider(sessionLoader: { MiSessionStore.load(defaults: ud) })
+            nonisolated(unsafe) let sessionDefaults = ud
+            self.provider = MiCloudProvider(sessionLoader: {
+                try MiSessionStore.loadChecked(defaults: sessionDefaults, vault: credentialVault)
+            }, apiFactory: cloudAPIFactory)
         } else if initialBackend == .demo {
             self.provider = DemoHomeProvider()
         } else {
